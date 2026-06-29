@@ -68,6 +68,12 @@ subcommand with `-h` for full flags.
 - **⚠ No re-attach**: Slack can't attach a file to an already-sent message. Post the
   file *with* `--comment` in one call instead of text-then-file.
 
+## Docs
+
+- [docs/commands.md](docs/commands.md) — full command + flag reference, target resolution.
+- [docs/block-kit.md](docs/block-kit.md) — mrkdwn rules, tables, markdown/mermaid→PNG, raw blocks, pitfalls.
+- [docs/agent-guide.md](docs/agent-guide.md) — I/O contract, posting discipline, search semantics, auth model.
+
 ## Token refresh hook
 
 On `401`/expiry the CLI tries, in order:
