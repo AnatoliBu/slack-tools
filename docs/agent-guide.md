@@ -48,7 +48,9 @@ Tokens live in `.env` (gitignored) or the environment. On `401`/expiry the CLI t
 in order:
 
 1. `$SLACK_TOKEN_REFRESH_CMD` — your own command that rewrites `.env` with fresh tokens
-   (wire any secret store or browser flow here).
+   (wire any secret store or browser flow here). For hands-off refresh, use
+   [cookie-jar](https://github.com/AnatoliBu/cookie-jar): a browser extension keeps the
+   tokens synced into a store, and `refresh_env.py` pulls them into `.env` on demand.
 2. `extract_tokens.py` — the bundled Chrome/CDP extractor (uses `$SLACK_WORKSPACE_URL`).
 3. otherwise a clear error.
 

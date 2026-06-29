@@ -83,6 +83,12 @@ On `401`/expiry the CLI tries, in order:
    ```
    SLACK_TOKEN_REFRESH_CMD="python my_refresh.local.py"
    ```
+   For fully hands-off refresh, pair it with [cookie-jar](https://github.com/AnatoliBu/cookie-jar) —
+   a browser extension that keeps `xoxc`/`xoxd` synced into a secret store while you
+   stay logged into Slack in Chrome. Then point the hook at its consumer:
+   ```
+   SLACK_TOKEN_REFRESH_CMD="python /path/to/cookie-jar/refresh_env.py .env SLACK_XOXC=slack/xoxc SLACK_XOXD=slack/xoxd"
+   ```
 2. **`extract_tokens.py`** — the bundled browser extractor (uses `$SLACK_WORKSPACE_URL`).
 3. otherwise a clear error telling you to set tokens.
 
