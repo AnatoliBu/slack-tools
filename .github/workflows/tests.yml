@@ -1,0 +1,26 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Syntax check
+        run: python -m compileall -q slack_cli.py send_blocks.py extract_tokens.py
+      - name: Unit tests (offline, no tokens)
+        run: |
+          python test_win_path.py
+          python test_read_render.py

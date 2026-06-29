@@ -1,21 +1,50 @@
 # slack-tools
 
-Agent-friendly Slack CLI built on browser tokens (`xoxc`/`xoxd`) — works as a
-**user**, not a bot. URL-first input, terse `key=value` output (or `--json`),
-Block Kit tables, mermaid→PNG, and a Playwright/CDP token extractor.
+> Agent-friendly Slack CLI built on browser tokens (`xoxc`/`xoxd`) — works as a
+> **user**, not a bot. URL-first input, terse `key=value`/JSON output, Block Kit
+> tables, mermaid→PNG, and a pluggable token-refresh hook.
 
-Designed to be driven by both humans and LLM agents: every command takes a
-Slack URL or `#channel`/`@user`/`C-id`, prints minimal machine-parsable output,
-and auto-refreshes expired tokens via a pluggable hook.
+[![tests](https://github.com/AnatoliBu/slack-tools/actions/workflows/tests.yml/badge.svg)](https://github.com/AnatoliBu/slack-tools/actions/workflows/tests.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+Designed to be driven by both humans and LLM agents: every command takes a Slack
+URL or `#channel`/`@user`/`C-id`, prints minimal machine-parsable output, and
+auto-refreshes expired tokens via a hook you control.
+
+```mermaid
+flowchart LR
+  you["you / agent"] -->|"slack send #chan …"| cli["slack_cli.py"]
+  cli -->|"xoxc + xoxd"| api["Slack Web API"]
+  cli -.->|"401 / expired"| hook{"refresh hook"}
+  hook -->|"SLACK_TOKEN_REFRESH_CMD"| store["secret store<br/>(cookie-jar / yours)"]
+  hook -->|"extract_tokens.py"| chrome["Chrome (CDP)"]
+  store -.-> env[".env"]
+  chrome -.-> env
+  env --> cli
+```
+
+## Contents
+
+- [Install](#install)
+- [Authenticate](#authenticate)
+- [Usage](#usage)
+- [Agent-friendly notes](#agent-friendly-notes)
+- [Docs](#docs)
+- [Token refresh hook](#token-refresh-hook)
+- [Tests](#tests)
+- [Contributing](#contributing) · [License](#license)
 
 ## Install
 
 ```bash
 pip install -r requirements.txt          # slack_sdk (+ websockets for the extractor)
+cp .env.example .env                      # then fill in tokens / workspace
 export SLACK_WORKSPACE_URL=https://your-workspace.slack.com
 ```
 
-Python 3.11+ (uses `tomllib`, modern typing).
+Python 3.11+ (uses `tomllib`, modern typing). Symlink/alias `slack_cli.py` as `slack`.
 
 ## Authenticate
 
@@ -26,15 +55,15 @@ SLACK_XOXC="xoxc-..."
 SLACK_XOXD="xoxd-..."
 ```
 
-Get them automatically with the bundled extractor (opens Chrome via CDP, you log
-in once, the profile persists):
+Get them automatically with the bundled extractor (opens Chrome via CDP, you log in
+once, the profile persists):
 
 ```bash
 python extract_tokens.py https://your-workspace.slack.com   # writes .env
 ```
 
 > Browser tokens act **as your user**. They expire on Slack logout — re-run the
-> extractor or refresh via the hook below.
+> extractor or wire the [refresh hook](#token-refresh-hook).
 
 ## Usage
 
@@ -54,10 +83,9 @@ slack channels --filter eng                     # discovery
 slack me                                         # whoami
 ```
 
-`slack_cli.py` is the entry point; symlink/alias it as `slack`. Run any
-subcommand with `-h` for full flags.
+Run any subcommand with `-h` for full flags. Full reference → [docs/commands.md](docs/commands.md).
 
-### Agent-friendly notes
+## Agent-friendly notes
 
 - **URL-first**: paste any Slack archive URL into `read`/`reply`/`edit`/`delete`/`react`;
   channel + ts + thread are parsed for you.
@@ -79,13 +107,10 @@ subcommand with `-h` for full flags.
 On `401`/expiry the CLI tries, in order:
 
 1. **`$SLACK_TOKEN_REFRESH_CMD`** — any command that rewrites `.env` with fresh
-   tokens. Wire your own secret store / browser flow here, e.g. in `.env`:
-   ```
-   SLACK_TOKEN_REFRESH_CMD="python my_refresh.local.py"
-   ```
-   For fully hands-off refresh, pair it with [cookie-jar](https://github.com/AnatoliBu/cookie-jar) —
-   a browser extension that keeps `xoxc`/`xoxd` synced into a secret store while you
-   stay logged into Slack in Chrome. Then point the hook at its consumer:
+   tokens. Wire your own secret store / browser flow here. For fully hands-off
+   refresh, pair it with [🍪 cookie-jar](https://github.com/AnatoliBu/cookie-jar) — a
+   browser extension that keeps `xoxc`/`xoxd` synced into a secret store while you stay
+   logged into Slack in Chrome:
    ```
    SLACK_TOKEN_REFRESH_CMD="python /path/to/cookie-jar/refresh_env.py .env SLACK_XOXC=slack/xoxc SLACK_XOXD=slack/xoxd"
    ```
@@ -99,17 +124,12 @@ python test_win_path.py       # path normalization (10)
 python test_read_render.py    # table render, --json placement, multi-file upload (8)
 ```
 
-No pytest required — each file runs standalone (exit 0 = pass).
+No pytest required — each file runs standalone (exit 0 = pass) and in CI on every push.
 
-## Files
+## Contributing
 
-```
-slack_cli.py        — the CLI (send/read/search/upload/download/files/table/md/blocks/…)
-send_blocks.py      — Block Kit builders + mermaid→PNG rendering
-extract_tokens.py   — Chrome/CDP token extractor → .env
-test_*.py           — standalone unit tests
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and small, focused PRs welcome.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE).
