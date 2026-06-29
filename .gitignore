@@ -1,0 +1,26 @@
+# secrets / tokens
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# bundled third-party binary (not shipped)
+bin/
+
+# browser profile used by extract_tokens.py
+chrome-profile/
+
+# local-only, machine-specific (kept out of the public repo)
+*.local.py
+refresh_*.local.py
+
+# personal note registry / vault (internal, not published)
+_docs/
+.note/
+
+# local helpers / reference material not part of the published CLI
+post_long.py
+references/
+scripts/
