@@ -20,12 +20,13 @@ Any command that takes a `target` accepts:
 ## Posting
 
 ```bash
-slack send <target> <text|@file|-> [--thread URL|ts] [--no-split] [--no-notify]
-slack reply <URL> <text|@file|->  [--no-split] [--no-notify]
+slack send <target> <text|@file|-> [--thread URL|ts] [--no-split] [--schedule ISO8601] [--no-notify]
+slack reply <URL> <text|@file|->  [--no-split] [--schedule ISO8601] [--no-notify]
 slack edit  <URL> <text|@file|->
 slack delete <URL>
 slack react   <URL> :emoji:
 slack unreact <URL> :emoji:
+slack forward <src> <dest> [--ts TS] [--comment "..."] [--thread URL|ts] [--no-notify]
 ```
 
 - `<text>` may be inline, `@file` (read file contents), or `-` (stdin).
@@ -33,6 +34,25 @@ slack unreact <URL> :emoji:
   `--no-split` disables.
 - Posting to a channel sends you a DM notification with the permalink; suppress with
   `--no-notify`, `SLACK_NOTIFY_CHANNELS=0`, or `~/.config/slack-cli/config.toml`.
+- `--schedule` posts later via `chat.scheduleMessage` instead of `chat.postMessage`.
+  Accepts ISO-8601 (`2026-07-20T09:00`, `…+03:00`, `…Z`) or a bare unix ts. Output is
+  `scheduled_message_id=…` + `post_at=…` (no permalink yet, no self-notify). Manage the
+  queue with [`scheduled`](#scheduling).
+- `forward` re-shares a message: it fetches the source's permalink (`chat.getPermalink`)
+  and posts it into `dest` with `unfurl` on, so Slack renders a preview (the Web API has
+  **no** native "share message"). `src` is an archive URL, or a target plus `--ts`;
+  `--comment` is prepended above the link.
+
+## Scheduling
+
+```bash
+slack scheduled [target] [--cancel SCHEDULED_MESSAGE_ID] [--limit N]
+```
+
+- With no `--cancel`, lists pending scheduled messages (`chat.scheduledMessages.list`)
+  as `<id> <post-at> <channel> <preview>`; pass a `target` to filter by channel.
+- `--cancel <id>` deletes one (`chat.deleteScheduledMessage`); it needs the `target`
+  (the channel the message was scheduled to).
 
 ## Files
 
@@ -65,6 +85,35 @@ slack whoami-msg <URL>                           # author of a message
 - `read` warns on stderr when output hit `--limit` (possible truncation).
 - `search` supports combining `--from` and `--in`; an empty result usually means the
   user simply did not post there, not a bug.
+
+## Channels & members
+
+```bash
+slack members <target> [--limit N]     # <user-id> <name> per line (id→name resolved)
+slack join    <target>                 # conversations.join
+slack leave   <target>                 # conversations.leave
+slack pin     <URL>                    # pins.add
+slack unpin   <URL>                    # pins.remove
+slack stats   <target> [--limit 500] [--top 10]
+```
+
+- `stats` aggregates `conversations.history` (up to `--limit` messages): top senders,
+  messages per day, and the share of messages with files / reactions. `--json` emits the
+  full breakdown; the default is terse `sender`/`day` rows plus summary counters.
+
+## Live polling (no RTM)
+
+```bash
+slack wait   <target> [--timeout 60] [--interval 3] [--after-ts TS] [--limit N]
+slack listen <target> [--interval 5] [--after-ts TS] [--limit N]
+```
+
+- **Browser (`xoxc`) tokens cannot use RTM / Socket Mode** — both commands poll
+  `conversations.history`, they do not stream.
+- `wait` blocks until a new message appears (prints it, exit 0) or `--timeout` elapses
+  (**exit 3**). `--after-ts` sets the baseline; default is the channel's current latest.
+- `listen` polls forever and prints each new message as one NDJSON line
+  (`{ts, channel, user, user_name, text}`); Ctrl-C to stop.
 
 ## Block Kit
 

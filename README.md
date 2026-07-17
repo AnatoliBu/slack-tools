@@ -77,11 +77,23 @@ slack search "query" --in #general --from @user --after 2026-01-01
 slack upload #general a.png b.png --comment "two files, one post"
 slack download <F-id> -o ./out.png
 slack files <URL> --thread --download ./dir
+slack forward <URL> #other --comment "fyi"      # re-share (permalink + unfurl preview)
+slack send #general "standup" --schedule 2026-07-20T09:00   # chat.scheduleMessage
+slack scheduled #general                        # list scheduled; --cancel <id> to drop
+slack members #general                           # <user-id> <name> per line
+slack pin <URL> / slack unpin <URL>              # pins.add / pins.remove
+slack join #general / slack leave #general
+slack stats #general --top 5                     # top senders, per-day, files/reactions
+slack wait #general --timeout 120                # block for a new message (exit 3 = timeout)
+slack listen #general                            # NDJSON stream of new msgs (polling; no RTM)
 slack table #general @rows.tsv --align l,c,r    # Block Kit table from TSV
 slack md #general @report.md                    # markdown; ```mermaid``` fences → PNG
 slack channels --filter eng                     # discovery
 slack me                                         # whoami
 ```
+
+> `wait`/`listen` poll `conversations.history` — browser (`xoxc`) tokens can't use
+> RTM/Socket Mode, so there's no true streaming.
 
 Run any subcommand with `-h` for full flags. Full reference → [docs/commands.md](docs/commands.md).
 
@@ -122,6 +134,7 @@ On `401`/expiry the CLI tries, in order:
 ```bash
 python test_win_path.py       # path normalization (10)
 python test_read_render.py    # table render, --json placement, multi-file upload (8)
+python test_commands.py       # forward/members/pin/join/schedule/stats/wait/listen (21)
 ```
 
 No pytest required — each file runs standalone (exit 0 = pass) and in CI on every push.

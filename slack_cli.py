@@ -663,8 +663,28 @@ def read_text_arg(arg: str) -> str:
     return arg
 
 
-def cmd_send(args):
-    client = _make_client()
+def iso_to_epoch(value: str) -> int:
+    """ISO-8601 → unix seconds for chat.scheduleMessage.post_at.
+
+    Accepts `2026-07-20T09:00`, `...:00+03:00`, `...Z`, or a bare unix ts.
+    Naive datetimes are interpreted in the local timezone (Slack schedules in
+    absolute unix time regardless). Also accepts a raw integer epoch string.
+    """
+    from datetime import datetime
+
+    v = value.strip()
+    if v.isdigit():
+        return int(v)
+    # datetime.fromisoformat handles 'Z' on py3.11+; be defensive for older forms.
+    try:
+        dt = datetime.fromisoformat(v)
+    except ValueError:
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    return int(dt.timestamp())
+
+
+def cmd_send(args, client=None):
+    client = client or _make_client()
     channel_id = resolve_target(args.target, client)
     thread_ts = None
     if args.thread:
@@ -678,6 +698,28 @@ def cmd_send(args):
     domain = team_domain(client)
 
     parts = split_text(text) if not args.no_split else [text]
+
+    # --schedule <ISO8601>: chat.scheduleMessage instead of chat.postMessage.
+    # No permalink/ts yet (message not posted) and no self-notify — return early.
+    schedule = getattr(args, "schedule", None)
+    if schedule:
+        post_at = iso_to_epoch(schedule)
+        ids: list[str] = []
+        for part in parts:
+            resp = _call("chat_scheduleMessage", _client=client, channel=channel_id,
+                         post_at=post_at, text=part, thread_ts=thread_ts,
+                         unfurl_links=False)
+            ids.append(resp.get("scheduled_message_id"))
+        save_last(channel_id, None, thread_ts)
+        audit("schedule", dest=dest.kind, name=dest.name, channel=channel_id,
+              thread_ts=thread_ts, parts=len(parts), post_at=post_at, ids=ids)
+        tstr = time.strftime("%Y-%m-%d %H:%M", time.localtime(post_at))
+        print(f"→ scheduled for {tstr} (post_at={post_at}) dest={dest.kind} {dest.name}"
+              f"{' (thread)' if thread_ts else ''}", file=sys.stderr)
+        emit({"scheduled_message_id": ids if len(ids) != 1 else ids[0],
+              "post_at": post_at, "dest": dest.kind, "parts": len(parts)}, args.json)
+        return
+
     urls: list[str] = []
     tss: list[str] = []
     first_ts = None
@@ -704,7 +746,7 @@ def cmd_send(args):
           "parts": len(parts), **({"urls": urls} if len(parts) > 1 else {})}, args.json)
 
 
-def cmd_reply(args):
+def cmd_reply(args, client=None):
     # reply <url> <text>
     channel_id, parent_ts, url_thread = parse_url(args.url)
     thread_ts = url_thread or parent_ts
@@ -712,8 +754,9 @@ def cmd_reply(args):
     fake = argparse.Namespace(
         target=channel_id, text=args.text, thread=thread_ts,
         json=args.json, no_split=args.no_split, notify=args.notify,
+        schedule=getattr(args, "schedule", None),
     )
-    cmd_send(fake)
+    cmd_send(fake, client=client)
 
 
 def cmd_edit(args):
@@ -1263,6 +1306,295 @@ def cmd_whoami_msg(args):
 
 
 # ---------------------------------------------------------------------------
+# Channel / message ops: forward, members, pin, join, scheduled, stats, wait
+# ---------------------------------------------------------------------------
+def _src_channel_ts(src: str, ts_arg: Optional[str], client: WebClient) -> tuple[str, str]:
+    """Resolve a forward/pin source into (channel_id, message_ts).
+
+    Accepts an archive URL (channel+ts parsed) or a target plus explicit --ts.
+    """
+    if "slack.com/archives/" in src:
+        channel_id, ts, _ = parse_url(src)
+        return channel_id, ts
+    if not ts_arg:
+        raise ValueError("src is a target, not a URL — provide --ts <message ts> "
+                         "(or pass a message archive URL)")
+    return resolve_target(src, client), ts_arg
+
+
+def cmd_forward(args, client=None):
+    """Forward a message: chat.getPermalink of the source + chat.postMessage of that
+    permalink into dest (unfurl renders a preview). Slack Web API has no native
+    'share message', so this is the robust equivalent."""
+    client = client or _make_client()
+    src_channel, src_ts = _src_channel_ts(args.src, args.ts, client)
+    perma = _call("chat_getPermalink", _client=client, channel=src_channel,
+                  message_ts=src_ts)
+    permalink = perma["permalink"]
+    dest_channel = resolve_target(args.dest, client)
+    thread_ts = _thread_ts(getattr(args, "thread", None))
+    text = f"{args.comment}\n{permalink}" if args.comment else permalink
+    domain = team_domain(client)
+    dest = dest_of(dest_channel, thread_ts, client)
+    # unfurl ON: we WANT the permalink to expand into a preview of the message
+    resp = _call("chat_postMessage", _client=client, channel=dest_channel, text=text,
+                 thread_ts=thread_ts, unfurl_links=True, unfurl_media=True)
+    ts = resp["ts"]
+    url = make_url(domain, dest_channel, ts, thread_ts)
+    save_last(dest_channel, ts, thread_ts)
+    audit("forward", src_channel=src_channel, src_ts=src_ts, dest=dest.kind,
+          name=dest.name, channel=dest_channel, url=url)
+    _notify_if_channel(args, client, dest, [url])
+    print(f"→ forwarded {permalink} → {dest.kind} {dest.name}", file=sys.stderr)
+    emit({"ts": ts, "url": url, "dest": dest.kind, "permalink": permalink}, args.json)
+
+
+def cmd_members(args, client=None):
+    """List channel members: `<user-id> <name>` per line (id→name via users cache)."""
+    client = client or _make_client()
+    channel_id = resolve_target(args.target, client)
+    ids: list[str] = []
+    cursor = None
+    while True:
+        resp = _call("conversations_members", _client=client, channel=channel_id,
+                     limit=200, cursor=cursor)
+        ids.extend(resp.get("members", []))
+        if args.limit and len(ids) >= args.limit:
+            ids = ids[:args.limit]
+            break
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    if args.json:
+        print(json.dumps([{"id": uid, "name": _user_name(uid, client)} for uid in ids],
+                         ensure_ascii=False, indent=2))
+        return
+    if not ids:
+        print("(no members)", file=sys.stderr)
+        return
+    for uid in ids:
+        print(f"{uid}\t{_user_name(uid, client)}")
+
+
+def cmd_pin(args, client=None):
+    client = client or _make_client()
+    channel_id, ts, _ = parse_url(args.url)
+    _call("pins_add", _client=client, channel=channel_id, timestamp=ts)
+    audit("pin", channel=channel_id, ts=ts)
+    emit({"ok": True, "channel": channel_id, "ts": ts}, args.json)
+
+
+def cmd_unpin(args, client=None):
+    client = client or _make_client()
+    channel_id, ts, _ = parse_url(args.url)
+    _call("pins_remove", _client=client, channel=channel_id, timestamp=ts)
+    audit("unpin", channel=channel_id, ts=ts)
+    emit({"ok": True, "channel": channel_id, "ts": ts}, args.json)
+
+
+def cmd_join(args, client=None):
+    client = client or _make_client()
+    channel_id = resolve_target(args.target, client)
+    resp = _call("conversations_join", _client=client, channel=channel_id)
+    ch = resp.get("channel") or {}
+    audit("join", channel=channel_id)
+    emit({"ok": True, "channel": channel_id, "name": ch.get("name")}, args.json)
+
+
+def cmd_leave(args, client=None):
+    client = client or _make_client()
+    channel_id = resolve_target(args.target, client)
+    resp = _call("conversations_leave", _client=client, channel=channel_id)
+    audit("leave", channel=channel_id)
+    emit({"ok": True, "channel": channel_id, "not_in_channel": resp.get("not_in_channel", False)},
+         args.json)
+
+
+def cmd_scheduled(args, client=None):
+    """List scheduled messages (chat.scheduledMessages.list) or cancel one
+    (chat.deleteScheduledMessage). Target filters the list by channel; for --cancel
+    the target is the channel the message was scheduled to."""
+    client = client or _make_client()
+    channel_id = None
+    if args.target and args.target != "*":
+        channel_id = resolve_target(args.target, client)
+    if args.cancel:
+        if not channel_id:
+            raise ValueError("scheduled --cancel <id> requires a target "
+                             "(the channel the message was scheduled to)")
+        _call("chat_deleteScheduledMessage", _client=client, channel=channel_id,
+              scheduled_message_id=args.cancel)
+        audit("scheduled-cancel", channel=channel_id, id=args.cancel)
+        emit({"ok": True, "cancelled": args.cancel, "channel": channel_id}, args.json)
+        return
+    kw = {"limit": args.limit}
+    if channel_id:
+        kw["channel"] = channel_id
+    resp = _call("chat_scheduledMessages_list", _client=client, **kw)
+    msgs = resp.get("scheduled_messages", []) or []
+    if args.json:
+        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        return
+    if not msgs:
+        print("(no scheduled messages)", file=sys.stderr)
+        return
+    for m in msgs:
+        post_at = m.get("post_at")
+        tstr = (time.strftime("%Y-%m-%d %H:%M", time.localtime(post_at))
+                if post_at else "?")
+        text = (m.get("text") or "").replace("\n", " ")[:80]
+        print(f"{m.get('id')}\t{tstr}\t{m.get('channel_id')}\t{text}")
+
+
+def cmd_stats(args, client=None):
+    """Aggregate conversations.history: top senders, per-day counts, files/reactions share."""
+    from collections import Counter
+    client = client or _make_client()
+    channel_id = resolve_target(args.target, client)
+    msgs: list[dict] = []
+    cursor = None
+    while len(msgs) < args.limit:
+        resp = _call("conversations_history", _client=client, channel=channel_id,
+                     limit=min(200, args.limit - len(msgs)), cursor=cursor)
+        batch = resp.get("messages", []) or []
+        msgs.extend(batch)
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor or not batch:
+            break
+    msgs = msgs[:args.limit]
+
+    by_user: Counter = Counter()
+    by_day: Counter = Counter()
+    with_files = with_reactions = 0
+    for m in msgs:
+        by_user[m.get("user") or m.get("bot_id") or "?"] += 1
+        ts = m.get("ts")
+        if ts and "." in ts:
+            by_day[time.strftime("%Y-%m-%d", time.localtime(float(ts)))] += 1
+        if m.get("files"):
+            with_files += 1
+        if m.get("reactions"):
+            with_reactions += 1
+    total = len(msgs)
+    top = by_user.most_common(args.top)
+
+    def _pct(n):
+        return round(100.0 * n / total, 1) if total else 0.0
+
+    if args.json:
+        print(json.dumps({
+            "channel": channel_id,
+            "total": total,
+            "top_senders": [{"user_id": u, "name": _user_name(u, client), "count": c}
+                            for u, c in top],
+            "per_day": dict(sorted(by_day.items())),
+            "with_files": with_files,
+            "with_reactions": with_reactions,
+            "files_pct": _pct(with_files),
+            "reactions_pct": _pct(with_reactions),
+        }, ensure_ascii=False, indent=2))
+        return
+    if not total:
+        print("(no messages)", file=sys.stderr)
+        return
+    print(f"messages={total}")
+    print(f"days={len(by_day)}")
+    print(f"with_files={with_files} ({_pct(with_files)}%)")
+    print(f"with_reactions={with_reactions} ({_pct(with_reactions)}%)")
+    for u, c in top:
+        print(f"sender\t{c}\t{u}\t{_user_name(u, client)}")
+    for day, c in sorted(by_day.items()):
+        print(f"day\t{day}\t{c}")
+
+
+def _print_new_messages(msgs: list[dict], channel_id: str, client: WebClient,
+                        as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        return
+    for m in msgs:
+        user = _user_name(m.get("user") or m.get("bot_id"), client)
+        ts = m.get("ts", "?")
+        tstr = (time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+                if "." in ts else ts)
+        text = (m.get("text") or "").replace("\n", " ")
+        print(f"--- @{user}  {tstr}  ts={ts}")
+        if text:
+            print(f"  {text}")
+
+
+def _baseline_ts(channel_id: str, client: WebClient) -> str:
+    """Latest ts in a channel — the poll baseline for wait/listen."""
+    resp = _call("conversations_history", _client=client, channel=channel_id, limit=1)
+    msgs = resp.get("messages", []) or []
+    return msgs[0].get("ts", "0") if msgs else "0"
+
+
+def cmd_wait(args, client=None):
+    """Poll conversations.history until a new message appears or timeout.
+
+    ⚠ RTM/Socket Mode are unavailable with browser (xoxc) tokens — polling only.
+    Exit 0 + prints the new message(s); exit 3 on timeout (no new message).
+    """
+    client = client or _make_client()
+    channel_id = resolve_target(args.target, client)
+    after_ts = args.after_ts or _baseline_ts(channel_id, client)
+    deadline = time.time() + args.timeout
+    while True:
+        resp = _call("conversations_history", _client=client, channel=channel_id,
+                     oldest=after_ts, limit=args.limit)
+        new = sorted((m for m in resp.get("messages", []) or []
+                      if m.get("ts", "0") > after_ts),
+                     key=lambda m: m.get("ts", "0"))
+        if new:
+            _print_new_messages(new, channel_id, client, args.json)
+            return
+        if time.time() >= deadline:
+            break
+        time.sleep(min(args.interval, max(0.0, deadline - time.time())))
+    print(f"[timeout] no new messages in {channel_id} after ts={after_ts} "
+          f"within {args.timeout}s", file=sys.stderr)
+    sys.exit(3)
+
+
+def cmd_listen(args, client=None):
+    """Infinite poll: print each new message as one NDJSON line (Ctrl-C to stop).
+
+    ⚠ RTM/Socket Mode are unavailable with browser (xoxc) tokens — polling only.
+    """
+    client = client or _make_client()
+    channel_id = resolve_target(args.target, client)
+    after_ts = args.after_ts or _baseline_ts(channel_id, client)
+    print(f"[listen] polling {channel_id} every {args.interval}s "
+          f"(Ctrl-C to stop; RTM/Socket Mode unavailable via xoxc)", file=sys.stderr)
+    max_iter = getattr(args, "_max_iterations", None)  # test hook (unbounded in prod)
+    it = 0
+    try:
+        while True:
+            resp = _call("conversations_history", _client=client, channel=channel_id,
+                         oldest=after_ts, limit=args.limit)
+            new = sorted((m for m in resp.get("messages", []) or []
+                          if m.get("ts", "0") > after_ts),
+                         key=lambda m: m.get("ts", "0"))
+            for m in new:
+                uid = m.get("user") or m.get("bot_id")
+                print(json.dumps({
+                    "ts": m.get("ts"),
+                    "channel": channel_id,
+                    "user": uid,
+                    "user_name": _user_name(uid, client),
+                    "text": m.get("text", ""),
+                }, ensure_ascii=False), flush=True)
+                after_ts = max(after_ts, m.get("ts", "0"))
+            it += 1
+            if max_iter is not None and it >= max_iter:
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("[listen] stopped", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Block Kit commands (table / data_table / markdown / mermaid-PNG / raw blocks)
 # Builders + mermaid rendering live in send_blocks.py (sibling module).
 # ---------------------------------------------------------------------------
@@ -1425,6 +1757,8 @@ def build_parser():
     s.add_argument("text", help="text | @file | -")
     s.add_argument("--thread", help="thread_ts or URL to reply into thread")
     s.add_argument("--no-split", action="store_true")
+    s.add_argument("--schedule", metavar="ISO8601",
+                   help="schedule for later (ISO-8601 or unix ts) via chat.scheduleMessage")
     s.add_argument("--notify", dest="notify", action="store_true", default=None)
     s.add_argument("--no-notify", dest="notify", action="store_false")
     s.set_defaults(func=cmd_send)
@@ -1433,6 +1767,8 @@ def build_parser():
     s.add_argument("url")
     s.add_argument("text")
     s.add_argument("--no-split", action="store_true")
+    s.add_argument("--schedule", metavar="ISO8601",
+                   help="schedule the reply for later (ISO-8601 or unix ts)")
     s.add_argument("--notify", dest="notify", action="store_true", default=None)
     s.add_argument("--no-notify", dest="notify", action="store_false")
     s.set_defaults(func=cmd_reply)
@@ -1561,6 +1897,67 @@ def build_parser():
     s.add_argument("--notify", dest="notify", action="store_true", default=None)
     s.add_argument("--no-notify", dest="notify", action="store_false")
     s.set_defaults(func=cmd_blocks)
+
+    s = addp("forward", help="forward a message (getPermalink + repost with unfurl)")
+    s.add_argument("src", help="source archive URL, or a target (with --ts)")
+    s.add_argument("dest", help="destination #channel | @user | C123 | URL")
+    s.add_argument("--ts", help="source message ts (when src is a target, not a URL)")
+    s.add_argument("--comment", help="text prepended before the forwarded permalink")
+    s.add_argument("--thread", help="post the forward into a thread (ts or URL)")
+    s.add_argument("--notify", dest="notify", action="store_true", default=None)
+    s.add_argument("--no-notify", dest="notify", action="store_false")
+    s.set_defaults(func=cmd_forward)
+
+    s = addp("members", help="list channel members (<user-id> <name>)")
+    s.add_argument("target")
+    s.add_argument("--limit", type=int, default=0, help="max members (0 = all)")
+    s.set_defaults(func=cmd_members)
+
+    s = addp("pin", help="pin a message (pins.add)")
+    s.add_argument("url")
+    s.set_defaults(func=cmd_pin)
+
+    s = addp("unpin", help="unpin a message (pins.remove)")
+    s.add_argument("url")
+    s.set_defaults(func=cmd_unpin)
+
+    s = addp("join", help="join a channel (conversations.join)")
+    s.add_argument("target")
+    s.set_defaults(func=cmd_join)
+
+    s = addp("leave", help="leave a channel (conversations.leave)")
+    s.add_argument("target")
+    s.set_defaults(func=cmd_leave)
+
+    s = addp("scheduled", help="list/cancel scheduled messages")
+    s.add_argument("target", nargs="?", help="filter by channel (omit or '*' for all)")
+    s.add_argument("--cancel", metavar="SCHEDULED_MESSAGE_ID",
+                   help="cancel a scheduled message (requires target = its channel)")
+    s.add_argument("--limit", type=int, default=100)
+    s.set_defaults(func=cmd_scheduled)
+
+    s = addp("stats", help="aggregate channel history (top senders, per-day, files/reactions)")
+    s.add_argument("target")
+    s.add_argument("--limit", type=int, default=500, help="messages to scan (history depth)")
+    s.add_argument("--top", type=int, default=10, help="how many top senders to show")
+    s.set_defaults(func=cmd_stats)
+
+    s = addp("wait", help="poll until a new message appears (exit 3 on timeout)")
+    s.add_argument("target")
+    s.add_argument("--timeout", type=float, default=60.0, help="seconds before giving up")
+    s.add_argument("--interval", type=float, default=3.0, help="poll interval seconds")
+    s.add_argument("--after-ts", dest="after_ts",
+                   help="baseline ts (default: current latest message)")
+    s.add_argument("--limit", type=int, default=50)
+    s.set_defaults(func=cmd_wait)
+
+    s = addp("listen", help="infinite poll → new messages as NDJSON (xoxc: no RTM/Socket)")
+    s.add_argument("target")
+    s.add_argument("--interval", type=float, default=5.0, help="poll interval seconds")
+    s.add_argument("--after-ts", dest="after_ts",
+                   help="baseline ts (default: current latest message)")
+    s.add_argument("--limit", type=int, default=50)
+    s.set_defaults(func=cmd_listen)
 
     return p
 

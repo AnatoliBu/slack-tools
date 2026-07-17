@@ -24,3 +24,4 @@ jobs:
         run: |
           python test_win_path.py
           python test_read_render.py
+          python test_commands.py
