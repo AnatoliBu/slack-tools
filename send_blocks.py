@@ -111,19 +111,57 @@ def split_md_mermaid(md):
 # --------------------------------------------------------------------------
 
 
-def find_chromium():
-    """Locate a chromium chrome.exe puppeteer can drive. Returns Windows path or None."""
+def _natural_key(s):
+    """Version-aware sort key: 'win64-99' < 'win64-131' (плоский sorted() даёт обратное,
+    т.к. '9' > '1' лексикографически → выбирался НЕ самый новый билд)."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def chromium_candidates():
+    """Glob-паттерны браузеров, которые может драйвить puppeteer — от предпочтительных к
+    fallback. Вынесено отдельно, чтобы тест мог проверить покрытие без реальной ФС.
+
+    ⚠ Историческая грабля (2026-07): было 4 паттерна, и ТРИ из них на машине с машинным
+    (не per-user) Chrome не срабатывали никогда, а единственный рабочий — puppeteer-кэш —
+    исчез вместе с каталогом → `slack md` перестал рендерить mermaid, хотя на диске лежало
+    три пригодных браузера. Поэтому здесь СУПЕРСЕТ: оба layout'а playwright
+    (`chrome-win64` — новый, `chrome-win` — старый), headless-shell'ы, Program Files (x64+x86)
+    и Edge. Ищем ШИРОКО: молчаливое «браузер не найден» дороже лишнего glob'а."""
     home = os.path.expanduser("~")
     local = os.environ.get("LOCALAPPDATA", "")
-    pats = [
-        os.path.join(home, ".cache", "puppeteer", "chrome", "*", "chrome-win64", "chrome.exe"),
-        # install-time quirk: `--path /c/Users/...` lands under C:\c\Users\...
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    j = os.path.join
+    return [
+        # 1. канонический puppeteer-кэш (то, что ставит `npx puppeteer browsers install`)
+        j(home, ".cache", "puppeteer", "chrome", "*", "chrome-win64", "chrome.exe"),
+        j(home, ".cache", "puppeteer", "chrome", "*", "chrome-win", "chrome.exe"),
+        j(home, ".cache", "puppeteer", "chrome-headless-shell", "*", "*", "chrome-headless-shell.exe"),
+        # 2. install-time quirk: `--path /c/Users/...` кладёт под C:\c\Users\...
         "C:/c/Users/*/.cache/puppeteer/chrome/*/chrome-win64/chrome.exe",
-        os.path.join(local, "ms-playwright", "chromium-*", "chrome-win", "chrome.exe"),
-        os.path.join(local, "Google", "Chrome", "Application", "chrome.exe"),
+        # 3. playwright — ОБА layout'а (новый chrome-win64, старый chrome-win) + headless shell
+        j(local, "ms-playwright", "chromium-*", "chrome-win64", "chrome.exe"),
+        j(local, "ms-playwright", "chromium-*", "chrome-win", "chrome.exe"),
+        j(local, "ms-playwright", "chromium_headless_shell-*", "*", "chrome-headless-shell.exe"),
+        # 4. системный Chrome: машинная установка (Program Files) и per-user (LocalAppData)
+        j(pf, "Google", "Chrome", "Application", "chrome.exe"),
+        j(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+        j(local, "Google", "Chrome", "Application", "chrome.exe"),
+        # 5. Edge — тот же chromium, годится как последний fallback
+        j(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+        j(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
     ]
-    for p in pats:
-        hits = sorted(glob.glob(p))
+
+
+def find_chromium():
+    """Locate a chromium chrome.exe puppeteer can drive. Returns Windows path or None.
+    PUPPETEER_EXECUTABLE_PATH перекрывает автопоиск (тот же контракт, что у
+    ~/.claude/scripts/lint-mermaid.py — валидатора mermaid в PostToolUse-хуке)."""
+    env = os.environ.get("PUPPETEER_EXECUTABLE_PATH")
+    if env and os.path.exists(env):
+        return env
+    for p in chromium_candidates():
+        hits = sorted(glob.glob(p), key=_natural_key)
         if hits:
             return hits[-1]
     return None
@@ -145,9 +183,25 @@ def render_mermaid(code, theme="default", bg="white"):
     conf = {"args": ["--no-sandbox"], **({"executablePath": chrome} if chrome else {})}
     Path(cfg).write_text(json.dumps(conf), encoding="utf-8")
     cmd = f'"{_mmdc_bin()}" -i "{mmd}" -o "{png}" -p "{cfg}" -t {theme} -b {bg} -s 2'
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    # encoding/errors ОБЯЗАТЕЛЬНЫ: text=True на Windows декодирует вывод как UTF-8, а cmd.exe
+    # печатает локализованные ошибки в OEM/CP1251 → UnicodeDecodeError в reader-треде subprocess
+    # и потеря текста ошибки ровно тогда, когда он нужнее всего (путь диагностики фейла).
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     if not os.path.exists(png):
         tail = (r.stderr or r.stdout or "")[-400:]
+        if not chrome:
+            # Fail LOUD и с рецептом: без executablePath mmdc уходит в пустой puppeteer-кэш
+            # и падает «Could not find Chrome» — раньше это читалось как «диаграмма битая».
+            raise RuntimeError(
+                "mermaid render failed: браузер для puppeteer НЕ НАЙДЕН.\n"
+                "  Искали (glob):\n    " + "\n    ".join(chromium_candidates()) + "\n"
+                "  Починка — любое из:\n"
+                "    1) PUPPETEER_EXECUTABLE_PATH=<путь к chrome.exe|msedge.exe>\n"
+                '    2) npx @puppeteer/browsers install chrome@stable --path "'
+                + os.path.join(os.path.expanduser("~"), ".cache", "puppeteer").replace("\\", "/")
+                + '"\n'
+                f"  mmdc сказал:\n{tail}")
         raise RuntimeError(f"mermaid render failed (chromium={chrome}):\n{tail}")
     return png
 
