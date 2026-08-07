@@ -102,7 +102,13 @@ Run any subcommand with `-h` for full flags. Full reference → [docs/commands.m
 
 - **URL-first**: paste any Slack archive URL into `read`/`reply`/`edit`/`delete`/`react`;
   channel + ts + thread are parsed for you.
-- **Output**: default `key=value` lines (stable, greppable); `--json` for raw API.
+- **Output**: default `key=value` lines (stable, greppable); `--json` for raw API —
+  **exactly one JSON document on stdout**, everything diagnostic on stderr.
+- **`read` unwraps Block Kit**: a message's real body lives in `blocks`; `text` is a
+  fallback Slack never renders. Printing that fallback collapsed a long post to its
+  first line (measured: 54 chars instead of 2454) and made readers conclude the thread
+  was truncated. `rich_text` now comes out as mrkdwn, `table`/`data_table` as aligned
+  text.
 - **Exit codes**: `0` ok · `1` Slack API / runtime error · `2` input rejected locally,
   nothing sent · `3` bad args (argparse) or `wait` timeout.
 - **Block Kit input is checked before the network**: `table`/`blocks`/`md` never turn a
@@ -145,6 +151,7 @@ On `401`/expiry the CLI tries, in order:
 ```bash
 python test_win_path.py       # path normalization (10)
 python test_read_render.py    # table render, --json placement, multi-file upload (8)
+python test_read_blocks.py    # rich_text/table render, blocks-over-fallback, one-JSON-doc (29)
 python test_commands.py       # forward/members/pin/join/schedule/stats/wait/listen (21)
 python test_input_validation.py  # table/blocks/md input rules, mrkdwn-vs-Markdown (41)
 python test_find_chromium.py  # chromium discovery for mermaid rendering (14)

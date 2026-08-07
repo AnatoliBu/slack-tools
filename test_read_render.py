@@ -52,8 +52,10 @@ def test_cell_text_variants():
 
 
 def test_rt_to_str_link_and_list():
+    # TASK-003: label БЕЗ url прятал, куда ссылка ведёт — читающему агенту это
+    # важнее краткости, поэтому теперь mrkdwn-форма `<url|label>`
     link = {"type": "link", "url": "https://x", "text": "X"}
-    assert s._rt_to_str(link) == "X"
+    assert s._rt_to_str(link) == "<https://x|X>"
     assert s._rt_to_str({"type": "link", "url": "https://x"}) == "https://x"
     lst = {"type": "rich_text_list", "elements": [
         {"type": "rich_text_section", "elements": [{"type": "text", "text": "a"}]},

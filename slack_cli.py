@@ -114,6 +114,27 @@ def _workspace_url() -> str:
             or env.get("SLACK_WORKSPACE_URL") or "").rstrip("/")
 
 
+def _run_quiet(cmd, shell: bool = False) -> None:
+    """subprocess.run, чей stdout НИКОГДА не попадает в наш stdout (TASK-003).
+
+    Дефолтный `subprocess.run` наследует наши дескрипторы, поэтому прогресс
+    extract_tokens.py (или чужой SLACK_TOKEN_REFRESH_CMD) приземлялся ПЕРЕД
+    json-документом и ломал `json.loads`. Живой поток сохраняем — токен-флоу
+    бывает интерактивным (ожидание логина), — просто перенаправляем в stderr.
+    """
+    try:
+        sys.stderr.fileno()
+        subprocess.run(cmd, shell=shell, check=True, stdout=sys.stderr)
+        return
+    except (AttributeError, OSError, ValueError):
+        pass  # stderr подменён (pytest capture, pipe-обёртка) — снимаем вывод в память
+    done = subprocess.run(cmd, shell=shell, check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    for stream in (done.stdout, done.stderr):
+        if stream:
+            sys.stderr.write(stream.decode("utf-8", errors="replace"))
+
+
 def _refresh_tokens() -> None:
     """(Re)obtain xoxc/xoxd tokens. Pluggable — no hardcoded personal/secret flow:
 
@@ -126,13 +147,12 @@ def _refresh_tokens() -> None:
     cmd = os.environ.get("SLACK_TOKEN_REFRESH_CMD") or env.get("SLACK_TOKEN_REFRESH_CMD")
     if cmd:
         print("→ refreshing Slack tokens via SLACK_TOKEN_REFRESH_CMD...", file=sys.stderr)
-        subprocess.run(cmd, shell=True, check=True)
+        _run_quiet(cmd, shell=True)
         return
     if EXTRACT_SCRIPT.exists():
         ws = _workspace_url()
         print("→ refreshing Slack tokens via extract_tokens.py...", file=sys.stderr)
-        subprocess.run([sys.executable, str(EXTRACT_SCRIPT)] + ([ws] if ws else []),
-                       check=True)
+        _run_quiet([sys.executable, str(EXTRACT_SCRIPT)] + ([ws] if ws else []))
         return
     raise RuntimeError(
         "Slack tokens missing/expired. Set SLACK_XOXC/SLACK_XOXD in .env, or run "
@@ -638,9 +658,25 @@ def _snippet_text(file_info: dict, max_bytes: int = 64 * 1024) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
+# TASK-003 — `--json` обязан класть на stdout РОВНО ОДИН валидный JSON-документ.
+# Наивный `json.loads(subprocess.run(...).stdout)` иначе падает с `Extra data: line N`,
+# и агент читает это как «CLI сломан». Два измеренных источника мусора:
+#   1) refresh токенов: подпроцесс наследовал наш stdout и печатал в него свой прогресс
+#      (extract_tokens.py — ~30 строк) ПЕРЕД json-ом → теперь всё уходит в stderr;
+#   2) обработчик ошибок в main(): печатал вторым документом поверх уже отданного.
+_JSON_EMITTED = False
+
+
+def emit_json(payload) -> None:
+    """Единственный JSON-документ прогона на stdout."""
+    global _JSON_EMITTED
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    _JSON_EMITTED = True
+
+
 def emit(payload: dict, as_json: bool = False) -> None:
     if as_json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        emit_json(payload)
     else:
         for k, v in payload.items():
             if isinstance(v, list):
@@ -825,30 +861,108 @@ def cmd_unreact(args):
 _BLOCK_PLACEHOLDERS = {"(table)", "(blocks)", "(data_table)"}
 
 
-def _rt_to_str(el) -> str:
-    """rich_text element/section → plain text (рекурсивно)."""
+# TASK-003 — `read` показывал только `text`-фоллбэк: тело в `blocks` схлопывалось в одну
+# строку, и читающий агент делал ЛОЖНЫЕ выводы («тред обрывается на висячем заголовке»,
+# «сломан bold — в тексте литеральные **»). И то и другое — артефакт фоллбэка: в блоках
+# лежит настоящий `style.bold`, а `**` ставит только fallback-текст.
+# Ниже — разворот rich_text в mrkdwn-эквивалент.
+_RT_STYLE_MARKS = (("code", "`"), ("bold", "*"), ("italic", "_"), ("strike", "~"))
+# элементы rich_text, которые сами по себе являются БЛОКОМ (нуждаются в своей строке)
+_RT_BLOCK_TYPES = ("rich_text_list", "rich_text_preformatted", "rich_text_quote")
+
+
+def _apply_rt_style(text: str, style) -> str:
+    """`{"text": "x", "style": {"bold": true}}` → `*x*` (Slack mrkdwn).
+
+    Внешние пробелы остаются СНАРУЖИ маркеров: `" bold "` → `" *bold* "`, а не `"* bold *"`
+    (Slack такое не отрендерил бы, и в выводе это выглядит как мусор).
+    """
+    if not text or not isinstance(style, dict):
+        return text
+    core = text.strip()
+    if not core:
+        return text
+    lead = text[:len(text) - len(text.lstrip())]
+    trail = text[len(text.rstrip()):]
+    for key, mark in _RT_STYLE_MARKS:
+        if style.get(key):
+            core = f"{mark}{core}{mark}"
+    return f"{lead}{core}{trail}"
+
+
+def _rt_to_str(el, styles: bool = True) -> str:
+    """rich_text element/section → текст (рекурсивно).
+
+    `styles=False` — внутри preformatted: там содержимое и так дословное, и маркеры
+    `*`/`` ` `` были бы враньём про исходный текст.
+    """
     if isinstance(el, str):
         return el
     if not isinstance(el, dict):
         return str(el)
     t = el.get("type")
     if t == "text":
-        return el.get("text", "")
+        raw = el.get("text", "")
+        return _apply_rt_style(raw, el.get("style")) if styles else raw
     if t == "link":
-        return el.get("text") or el.get("url", "")
+        url, label = el.get("url", ""), el.get("text") or ""
+        out = f"<{url}|{label}>" if url and label and label != url else (url or label)
+        return _apply_rt_style(out, el.get("style")) if styles else out
     if t == "emoji":
         return f":{el.get('name', '')}:"
     if t == "user":
-        return f"<@{el.get('user_id', '')}>"
+        return f"@{el.get('user_id', '')}"
+    if t == "usergroup":
+        return f"@{el.get('usergroup_id') or el.get('id', '')}"
+    if t == "channel":
+        return f"#{el.get('channel_id', '')}"
+    if t == "broadcast":
+        return f"@{el.get('range', 'channel')}"
+    if t == "date":
+        return str(el.get("fallback") or el.get("text") or el.get("timestamp", ""))
+    if t == "color":
+        return str(el.get("value", ""))
     if t == "rich_text_list":
-        items = ["• " + "".join(_rt_to_str(e) for e in it.get("elements", []))
-                 for it in el.get("elements", [])]
-        return "\n".join(items)
-    if "elements" in el:  # rich_text / rich_text_section / preformatted / quote
-        return "".join(_rt_to_str(e) for e in el["elements"])
+        ordered = el.get("style") == "ordered"
+        pad = "    " * int(el.get("indent") or 0)
+        offset = int(el.get("offset") or 0)
+        lines = []
+        for i, item in enumerate(el.get("elements") or [], start=1):
+            marker = f"{offset + i}." if ordered else "•"
+            first, *rest = _rt_to_str(item, styles).split("\n")
+            lines.append(f"{pad}{marker} {first}")
+            lines.extend(f"{pad}{' ' * (len(marker) + 1)}{r}" for r in rest)
+        return "\n".join(lines)
+    if t == "rich_text_preformatted":
+        body = "".join(_rt_to_str(e, styles=False) for e in el.get("elements") or [])
+        return "```\n" + body.strip("\n") + "\n```" if body.strip() else ""
+    if t == "rich_text_quote":
+        body = "".join(_rt_to_str(e, styles) for e in el.get("elements") or [])
+        return "\n".join(f"> {ln}" if ln else ">" for ln in body.strip("\n").split("\n"))
+    if t == "rich_text":
+        return _rt_children_to_str(el.get("elements") or [], styles)
+    if "elements" in el:  # rich_text_section и всё неизвестное с elements
+        return "".join(_rt_to_str(e, styles) for e in el["elements"])
     if isinstance(el.get("text"), str):
         return el["text"]
     return ""
+
+
+def _rt_children_to_str(children, styles: bool = True) -> str:
+    """Склейка детей `rich_text`: секции идут встык (переводы строк у них ВНУТРИ,
+    отдельными `text`-элементами), а список/preformatted/quote отбиваются своей строкой."""
+    parts: list[str] = []
+    for child in children:
+        rendered = _rt_to_str(child, styles)
+        if not rendered:
+            continue
+        is_block = isinstance(child, dict) and child.get("type") in _RT_BLOCK_TYPES
+        if is_block and parts and not parts[-1].endswith("\n"):
+            parts.append("\n")
+        parts.append(rendered)
+        if is_block and not rendered.endswith("\n"):
+            parts.append("\n")
+    return "".join(parts)
 
 
 def _cell_text(cell) -> str:
@@ -879,13 +993,62 @@ def _render_table_block(block) -> str:
     return f"[{cap}]\n{table}" if cap and block.get("type") == "data_table" else table
 
 
+def _render_block(block) -> str:
+    """Любой Block Kit блок → текст. Пустая строка = блок нечего показывать."""
+    if not isinstance(block, dict):
+        return ""
+    t = block.get("type")
+    if t in ("table", "data_table"):
+        return _render_table_block(block)
+    if t == "rich_text":
+        return _rt_children_to_str(block.get("elements") or []).strip("\n")
+    if t == "markdown":  # то, что кладёт `slack md` / `slack blocks`
+        return (block.get("text") or "").strip("\n")
+    if t in ("section", "header"):
+        parts = []
+        txt = block.get("text")
+        if isinstance(txt, dict):
+            parts.append(txt.get("text", ""))
+        elif isinstance(txt, str):
+            parts.append(txt)
+        for field in block.get("fields") or []:
+            if isinstance(field, dict) and field.get("text"):
+                parts.append(field["text"])
+        return "\n".join(p for p in parts if p).strip("\n")
+    if t == "context":
+        out = []
+        for el in block.get("elements") or []:
+            if isinstance(el, dict):
+                out.append(el.get("text") or el.get("alt_text") or "")
+        return " ".join(p for p in out if p).strip()
+    if t == "divider":
+        return "---"
+    if t == "image":
+        title = block.get("title")
+        label = (title or {}).get("text", "") if isinstance(title, dict) else (title or "")
+        return " ".join(p for p in ("[image]", label, block.get("alt_text") or "",
+                                    block.get("image_url") or "") if p)
+    return ""
+
+
+def _render_blocks(blocks) -> list[tuple[str, str]]:
+    """[(block_type, rendered_text)] без пустых — то, что реально видно в Slack."""
+    out = []
+    for block in blocks or []:
+        rendered = _render_block(block)
+        if rendered:
+            out.append((block.get("type") if isinstance(block, dict) else "", rendered))
+    return out
+
+
 def cmd_read(args):
     client = _make_client()
     _, msgs = _messages_for_target(args.target, client, args.limit, force_thread=args.thread)
+    # фильтруем None (reply/parent не найден) — иначе json мог быть пустым/ломаным
+    msgs = [m for m in msgs if m]
 
     if args.json:
-        # фильтруем None (reply/parent не найден) — иначе json мог быть пустым/ломаным
-        print(json.dumps([m for m in msgs if m], ensure_ascii=False, indent=2))
+        emit_json(msgs)
         return
     total_files = 0
     for m in msgs:
@@ -895,18 +1058,25 @@ def cmd_read(args):
         print(f"--- @{user}  {tstr}  ts={ts}")
         text = (m.get("text") or "").rstrip("\n")
         blocks = m.get("blocks") or []
-        table_blocks = [b for b in blocks if b.get("type") in ("table", "data_table")]
-        # text не печатаем, если он лишь fallback-плейсхолдер ((table)/(blocks)) или
-        # дублирует caption data_table — содержимое и так в отрендеренных блоках
-        _captions = {b.get("caption") for b in table_blocks if b.get("caption")}
-        if text and table_blocks and (text in _BLOCK_PLACEHOLDERS or text in _captions):
-            text = ""
+        rendered = _render_blocks(blocks)
+        body = "\n".join(r for _, r in rendered)
+        if body:
+            # TASK-003 — блоки победили: `text` при наличии blocks это лишь фоллбэк,
+            # Slack его НЕ показывает, и печатать его вместо тела = врать читающему.
+            # Исключение — таблица: `slack table --caption` кладёт подпись ТОЛЬКО в
+            # `text` (обычный `table` не носит caption), поэтому для табличных
+            # сообщений остаётся прежнее правило «снять только плейсхолдер/дубль».
+            _captions = {b.get("caption") for b in blocks
+                         if isinstance(b, dict) and b.get("caption")}
+            table_only = all(bt in ("table", "data_table") for bt, _ in rendered)
+            if not table_only or text in _BLOCK_PLACEHOLDERS or text in _captions:
+                text = ""
         if text:
             print(f"  {_indent_text(text)}")
-        for tb in table_blocks:
-            print(f"  {_indent_text(_render_table_block(tb))}")
+        if body:
+            print(f"  {_indent_text(body)}")
         files = m.get("files", []) or []
-        if not text and not table_blocks and not files:
+        if not text and not body and not files:
             print("  ")
         for file_info in files:
             total_files += 1
@@ -1001,7 +1171,7 @@ def cmd_search(args):
     matches = resp.get("messages", {}).get("matches", [])
 
     if args.json:
-        print(json.dumps(matches, ensure_ascii=False, indent=2))
+        emit_json(matches)
         return
     for m in matches:
         ch = m.get("channel", {})
@@ -1048,8 +1218,7 @@ def cmd_channels(args):
         rows.append((cid, name, "private" if info.get("is_private") else "public"))
     rows.sort(key=lambda r: r[1])
     if args.json:
-        print(json.dumps([{"id": r[0], "name": r[1], "visibility": r[2]} for r in rows],
-                         ensure_ascii=False, indent=2))
+        emit_json([{"id": r[0], "name": r[1], "visibility": r[2]} for r in rows])
         return
     for cid, name, vis in rows:
         print(f"{cid}\t{vis}\t#{name}")
@@ -1088,8 +1257,8 @@ def cmd_users(args):
         rows.append((uid, name, display, real))
     rows.sort(key=lambda r: r[1])
     if args.json:
-        print(json.dumps([{"id": r[0], "name": r[1], "display_name": r[2], "real_name": r[3]}
-                          for r in rows], ensure_ascii=False, indent=2))
+        emit_json([{"id": r[0], "name": r[1], "display_name": r[2], "real_name": r[3]}
+                   for r in rows])
         return
     for uid, name, display, real in rows:
         shown = display or real or name
@@ -1127,7 +1296,7 @@ def cmd_files(args):
             })
 
     if args.json:
-        print(json.dumps(files, ensure_ascii=False, indent=2))
+        emit_json(files)
     else:
         if not files:
             print(f"(файлов не найдено; сообщений просмотрено: {len(msgs)}"
@@ -1204,7 +1373,7 @@ def cmd_reactions(args):
     msg = resp.get("message", {})
     reactions = msg.get("reactions", []) or []
     if args.json:
-        print(json.dumps(reactions, ensure_ascii=False, indent=2))
+        emit_json(reactions)
         return
     if not reactions:
         print("(no reactions)", file=sys.stderr)
@@ -1233,7 +1402,7 @@ def cmd_mentions(args):
     matches = resp.get("messages", {}).get("matches", [])
 
     if args.json:
-        print(json.dumps(matches, ensure_ascii=False, indent=2))
+        emit_json(matches)
         return
     if not matches:
         print("(no mentions)", file=sys.stderr)
@@ -1283,7 +1452,7 @@ def cmd_unread(args):
                 "is_dm": ch.get("is_im"),
                 "is_mpim": ch.get("is_mpim"),
             })
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+        emit_json(out)
         return
     if not unread:
         print("(no unread)", file=sys.stderr)
@@ -1390,8 +1559,7 @@ def cmd_members(args, client=None):
         if not cursor:
             break
     if args.json:
-        print(json.dumps([{"id": uid, "name": _user_name(uid, client)} for uid in ids],
-                         ensure_ascii=False, indent=2))
+        emit_json([{"id": uid, "name": _user_name(uid, client)} for uid in ids])
         return
     if not ids:
         print("(no members)", file=sys.stderr)
@@ -1457,7 +1625,7 @@ def cmd_scheduled(args, client=None):
     resp = _call("chat_scheduledMessages_list", _client=client, **kw)
     msgs = resp.get("scheduled_messages", []) or []
     if args.json:
-        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        emit_json(msgs)
         return
     if not msgs:
         print("(no scheduled messages)", file=sys.stderr)
@@ -1506,7 +1674,7 @@ def cmd_stats(args, client=None):
         return round(100.0 * n / total, 1) if total else 0.0
 
     if args.json:
-        print(json.dumps({
+        emit_json({
             "channel": channel_id,
             "total": total,
             "top_senders": [{"user_id": u, "name": _user_name(u, client), "count": c}
@@ -1516,7 +1684,7 @@ def cmd_stats(args, client=None):
             "with_reactions": with_reactions,
             "files_pct": _pct(with_files),
             "reactions_pct": _pct(with_reactions),
-        }, ensure_ascii=False, indent=2))
+        })
         return
     if not total:
         print("(no messages)", file=sys.stderr)
@@ -1534,7 +1702,7 @@ def cmd_stats(args, client=None):
 def _print_new_messages(msgs: list[dict], channel_id: str, client: WebClient,
                         as_json: bool) -> None:
     if as_json:
-        print(json.dumps(msgs, ensure_ascii=False, indent=2))
+        emit_json(msgs)
         return
     for m in msgs:
         user = _user_name(m.get("user") or m.get("bot_id"), client)
@@ -2035,7 +2203,20 @@ def api_error_details(response) -> list:
     return out
 
 
+def _emit_error_json(payload: dict) -> None:
+    """Диагностический JSON ошибки — на stdout, но ТОЛЬКО если документа там ещё не было.
+    Иначе (команда уже отдала результат и упала после) он уходит в stderr: второй документ
+    на stdout ломает `json.loads` у вызывающего, а это ровно тот отказ, что чинит TASK-003."""
+    dumped = json.dumps(payload, ensure_ascii=False, indent=2)
+    if _JSON_EMITTED:
+        print(dumped, file=sys.stderr)
+    else:
+        print(dumped)
+
+
 def main():
+    global _JSON_EMITTED
+    _JSON_EMITTED = False  # per-run: иначе флаг течёт между вызовами main() в одном процессе
     parser = build_parser()
     args = parser.parse_args()
     try:
@@ -2044,8 +2225,8 @@ def main():
         # exit 2 = input rejected locally, nothing was sent
         print(f"ERROR: {e}", file=sys.stderr)
         if getattr(args, "json", False):
-            print(json.dumps({"ok": False, "error": e.code, "message": e.headline,
-                              "hints": e.hints}, ensure_ascii=False, indent=2))
+            _emit_error_json({"ok": False, "error": e.code, "message": e.headline,
+                              "hints": e.hints})
         sys.exit(2)
     except SlackApiError as e:
         print(f"ERROR: Slack API: {e.response.get('error')}", file=sys.stderr)
@@ -2056,7 +2237,7 @@ def main():
                   "offending block; `--json` prints the full response",
                   file=sys.stderr)
         if args.json:
-            print(json.dumps(dict(e.response.data), indent=2))
+            _emit_error_json(dict(e.response.data))
         sys.exit(1)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)

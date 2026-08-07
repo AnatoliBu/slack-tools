@@ -81,7 +81,20 @@ slack whoami-msg <URL>                           # author of a message
 ```
 
 - For a Slack URL, `read` shows that single message; `--thread` expands the whole
-  thread. Block Kit `table`/`data_table` are rendered as aligned text.
+  thread.
+- **`read` renders `blocks`, not the `text` fallback.** A Block Kit message keeps its
+  body in `blocks`; `text` is a fallback Slack never displays, and printing it collapsed
+  a long post to its first line (measured on a live thread: 54 chars instead of 2454).
+  `rich_text` styles come out as mrkdwn (`*bold*`, `_italic_`, `` `code` ``, `~strike~`),
+  links as `<url|label>`, lists as `•`/`1.`, `rich_text_preformatted` inside ``` fences
+  (styles are *not* applied there), `rich_text_quote` as `> `. `table`/`data_table` are
+  still rendered as aligned text. `text` is printed only when there are no blocks — the
+  one exception is a table, because `slack table --caption` stores the caption *only* in
+  `text`.
+- `read --json` prints **exactly one** JSON document on stdout — `json.loads` needs no
+  pre-processing. Every diagnostic (including the token-refresh subprocess) goes to
+  stderr. `slack listen` is the deliberate exception: it is an NDJSON stream, one
+  compact document per line.
 - `read` warns on stderr when output hit `--limit` (possible truncation).
 - `search` supports combining `--from` and `--in`; an empty result usually means the
   user simply did not post there, not a bug.

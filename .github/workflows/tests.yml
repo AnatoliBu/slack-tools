@@ -24,6 +24,7 @@ jobs:
         run: |
           python test_win_path.py
           python test_read_render.py
+          python test_read_blocks.py
           python test_commands.py
           python test_find_chromium.py
           python test_input_validation.py
