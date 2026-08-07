@@ -3,6 +3,9 @@
 send_blocks.py - Block Kit helpers + sender (user-token xoxc/xoxd). 2026-06.
 
 Used as a LIBRARY by slack_cli.py subcommands `table` / `md` / `blocks`:
+  validate_tsv(tsv, kind, src)                 -> rows | raise TableInputError
+  parse_blocks_json(text, src)                 -> [block] | raise BlocksInputError
+  mrkdwn_warning(text) / mrkdwn_to_markdown(t) -> *x*(mrkdwn bold) vs **x**(Markdown bold)
   build_table_block(tsv, kind, align, caption) -> table | data_table block
   chunk_markdown(text, lim=11000)              -> [ markdown block, ... ]
   split_md_mermaid(md)                         -> [ ("md", text) | ("mermaid", code), ... ]
@@ -19,6 +22,7 @@ Confirmed renders with USER token via chat.postMessage:
   table cells: use raw_text / rich_text (raw_number needs a special shape — skip)
 
 Env: SLACK_XOXC, SLACK_XOXD (auto-loaded from ~/PythonProjects/slack-tools/.env)
+Exit codes (standalone): 0=ok, 1=API error, 2=input rejected locally (nothing sent)
 """
 import argparse
 import glob
@@ -42,24 +46,245 @@ for _s in (sys.stdout, sys.stderr):
 
 ENV_FILE = Path.home() / "PythonProjects" / "slack-tools" / ".env"
 MD_LIMIT = 11000  # markdown block text limit (Slack ~12000, reserve)
+TABLE_MAX_ROWS = 100  # Block Kit hard limit for table/data_table
+TABLE_MAX_COLS = 20
 _ALIGN = {"l": "left", "c": "center", "r": "right",
           "left": "left", "center": "center", "right": "right"}
+
+
+# --------------------------------------------------------------------------
+# Input validation (local, BEFORE any Slack call)
+# --------------------------------------------------------------------------
+# Slack answers every malformed Block Kit payload with the same word:
+# `invalid_blocks`. The real reason sits in response_metadata.messages and used
+# to be dropped by the CLI, so "uneven rows", ">20 columns", "empty table",
+# "empty header cell" and "broken JSON" were indistinguishable — three blind
+# sends per diagnosis (measured 2026-08-07). Everything below is decidable from
+# the input alone, so it is decided here, with the fix recipe in the message.
+
+
+class InputError(ValueError):
+    """Locally-detected bad input — nothing was sent. CLI maps it to exit 2.
+
+    `.code` is the stable machine-readable reason; `str(e)` is the human/agent
+    text: one headline plus `hint:` lines that say what to do next.
+    Subclasses ValueError so pre-existing `except ValueError` callers still work.
+    """
+
+    def __init__(self, code, message, hints=()):
+        self.code = code
+        self.headline = message
+        # de-dup, order-preserving: per-row diagnostics repeat verbatim when the same
+        # cause hit several rows, and three identical paragraphs read as noise
+        self.hints = list(dict.fromkeys(h for h in hints if h))
+        super().__init__(message + "".join(f"\n  hint: {h}" for h in self.hints))
+
+
+class TableInputError(InputError):
+    """Bad TSV / table shape."""
+
+
+class BlocksInputError(InputError):
+    """Bad raw-blocks JSON."""
+
+
+_PRINTF_HINT = (
+    "printf does NOT expand escapes inside %s arguments — only inside the format "
+    "string and inside %b. Fix: printf 'a\\tb\\n' ... (tabs in the format), or "
+    "printf '%b\\n' 'a\\tb', or feed a real file"
+)
+_CAT_A_HINT = "verify the separators: <your-cmd> | cat -A   (a real TAB shows as ^I)"
+
+
+def _row_reason(line, got, want):
+    """Actionable cause for one row whose column count is off — phrased WITHOUT the
+    row number, so rows sharing a cause can be grouped into a single hint."""
+    if not line.strip():
+        return "blank line — it becomes a 1-cell row; drop empty lines"
+    if "\\t" in line:
+        return ('literal "\\t" inside (backslash + t, not a TAB) — the TSV was probably '
+                f"built with printf '%s': {_PRINTF_HINT}")
+    if "\t" not in line:
+        sep = next((s for s in (";", "|", ",") if s in line), None)
+        if sep:
+            return (f"no TAB at all but {sep!r} present — this command needs "
+                    f"TAB-separated values, not {sep}-separated")
+        if "  " in line:
+            return ("no TAB at all, only runs of spaces — spaces are not a separator, "
+                    "use real TABs")
+        return "no TAB at all — this command needs TAB-separated values"
+    if line.endswith("\t") and got == want + 1:
+        return (f"trailing TAB → an extra empty cell ({got} vs header's {want}); "
+                "strip it")
+    return f"{got} column(s) vs header's {want}"
+
+
+def _group_row_hints(bad, want, max_groups=3):
+    """[(row_no, line, got)] -> hints, one per distinct cause: `row(s) 2, 3: <cause>`."""
+    groups = {}
+    for idx, line, got in bad:
+        groups.setdefault(_row_reason(line, got, want), []).append(idx)
+    hints = []
+    for reason, rows in list(groups.items())[:max_groups]:
+        shown = ", ".join(str(r) for r in rows[:6])
+        more = f" (+{len(rows) - 6} more)" if len(rows) > 6 else ""
+        hints.append(f"row{'s' if len(rows) > 1 else ''} {shown}{more}: {reason}")
+    return hints
+
+
+def validate_tsv(tsv_text, kind="table", src=""):
+    """TSV text -> list[list[str]] of cells, or raise TableInputError.
+
+    Checks, in order: empty input, header-only input, literal-`\\t` input,
+    uneven rows, empty header cell, Block Kit 100x20 limit.
+    `src` is the original CLI argument (e.g. `@rows.tsv`) — used only to sharpen
+    the message when an `@file` silently fell through as a literal.
+    """
+    lines = tsv_text.rstrip("\n").splitlines()
+    if not lines or not tsv_text.strip():
+        raise TableInputError(
+            "EMPTY_INPUT", "table input is empty — nothing to post",
+            ["did the producing command print anything? " + _CAT_A_HINT,
+             "reading a file? pipe it: `cat rows.tsv | slack table <target> -`, "
+             "or pass a drive-letter path: `@C:/path/rows.tsv`"])
+
+    rows = [line.split("\t") for line in lines]
+    nrows = len(rows)
+    ncols = max(len(r) for r in rows)
+    literal_tab = any("\\t" in line for line in lines)
+
+    if nrows == 1:
+        hints = ["a table needs a header row AND at least one data row; "
+                 "got a single line"]
+        if ncols == 1:
+            looks_like_file = lines[0].startswith("@") or src.startswith("@")
+            hints.append(
+                "rows=1 cols=1 on non-empty input is the classic symptom of an `@file` "
+                "that was never read: on MSYS/Git-Bash the literal argument becomes one "
+                "cell. Pipe instead: `cat f.tsv | slack table <target> -`, or use "
+                "`@C:/path/f.tsv`" if looks_like_file else
+                "the single line has no TAB in it — " + _CAT_A_HINT)
+        if literal_tab:
+            hints.append(f'the line contains a literal "\\t" — {_PRINTF_HINT}')
+        raise TableInputError(
+            "SINGLE_ROW",
+            f"table input has only 1 row ({ncols} column(s)) — header without data",
+            hints)
+
+    if literal_tab and ncols == 1:
+        raise TableInputError(
+            "LITERAL_TAB",
+            f'every one of the {nrows} rows is a single cell containing a literal "\\t" '
+            "(backslash + t) — the TAB separators were never expanded",
+            [_PRINTF_HINT, _CAT_A_HINT])
+
+    want = len(rows[0])
+    bad = [(i + 1, lines[i], len(r)) for i, r in enumerate(rows) if len(r) != want]
+    if bad:
+        shown = ", ".join(f"row {i}={got}" for i, _, got in bad[:5])
+        more = f" (+{len(bad) - 5} more)" if len(bad) > 5 else ""
+        raise TableInputError(
+            "UNEVEN_ROWS",
+            f"uneven table rows: header (row 1) has {want} column(s), but {len(bad)} "
+            f"row(s) differ — {shown}{more}. Slack rejects this as "
+            "`invalid_blocks` / `uneven_table_rows_not_allowed`",
+            _group_row_hints(bad, want) + [_CAT_A_HINT])
+
+    # Zero-length cell -> `invalid_blocks` / "must be more than 0 characters".
+    # Measured against the live API 2026-08-07 (probe: header cell, body cell,
+    # whole body row, space-only cell): rejection applies to EVERY row, not just
+    # the header, and a single SPACE is accepted — so the test is `== ""`, not
+    # `.strip()`, otherwise a legitimate " " placeholder would be false-flagged.
+    empty = [(r + 1, c + 1) for r, cells in enumerate(rows)
+             for c, cell in enumerate(cells) if cell == ""]
+    if empty:
+        where = ", ".join(f"row {r} col {c}" for r, c in empty[:5])
+        more = f" (+{len(empty) - 5} more)" if len(empty) > 5 else ""
+        r0, c0 = empty[0]
+        hints = ["Slack answers `invalid_blocks` with "
+                 f"`[ERROR] must be more than 0 characters [json-pointer:/blocks/0/rows/"
+                 f"{r0 - 1}/{c0 - 1}/text]` — measured 2026-08-07, header AND data rows alike",
+                 'a single SPACE is accepted: use " ", "-" or "—" for an intentionally '
+                 "blank cell"]
+        if r0 == 1:
+            hints.append(f"row 1 is the header: give column {c0} a name "
+                         "(e.g. `Вердикт`, `Status`, `#`) or drop that column everywhere")
+        if lines[r0 - 1].endswith("\t"):
+            hints.append(f"row {r0} ends with a TAB — a trailing TAB creates an empty "
+                         "last cell; strip it")
+        raise TableInputError(
+            "EMPTY_CELL",
+            f"{len(empty)} empty cell(s) — {where}{more}. Block Kit rejects a "
+            "zero-length cell",
+            hints)
+
+    if nrows > TABLE_MAX_ROWS or ncols > TABLE_MAX_COLS:
+        raise TableInputError(
+            "LIMIT_EXCEEDED",
+            f"table is {nrows}x{ncols} (rows x cols, header included) — Block Kit "
+            f"allows at most {TABLE_MAX_ROWS} rows x {TABLE_MAX_COLS} columns; the API "
+            "would answer `invalid_blocks`",
+            ([f"{nrows} rows > {TABLE_MAX_ROWS}: split into several messages "
+              f"(e.g. `head -n {TABLE_MAX_ROWS}`) or post the file: "
+              "`slack upload <target> rows.tsv`"] if nrows > TABLE_MAX_ROWS else [])
+            + ([f"{ncols} columns > {TABLE_MAX_COLS}: drop columns, or post as "
+                "markdown/file instead"] if ncols > TABLE_MAX_COLS else []))
+    return rows
+
+
+def parse_blocks_json(text, src=""):
+    """Raw-blocks JSON text -> list[dict], or raise BlocksInputError.
+
+    Same contract as validate_tsv: everything decidable locally is decided here,
+    so `slack blocks` never turns a typo into a bare `invalid_blocks`.
+    """
+    if not text or not text.strip():
+        raise BlocksInputError(
+            "EMPTY_INPUT", "blocks input is empty — nothing to post",
+            ["pass a JSON array: `slack blocks <target> '[{\"type\":\"markdown\","
+             "\"text\":\"hi\"}]'`, `@blocks.json` or `-` (stdin)"])
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        preview = text.strip().replace("\n", "\\n")[:120]
+        hints = [f"parser said: {e.msg} at line {e.lineno} col {e.colno}",
+                 f"input started with: {preview}"]
+        if text.strip().startswith("@") or src.startswith("@"):
+            hints.append("the argument still looks like `@file` — the file was NOT read "
+                         "(missing path?). Pipe it instead: `cat blocks.json | slack "
+                         "blocks <target> -`, or use `@C:/path/blocks.json`")
+        raise BlocksInputError("INVALID_JSON", "blocks input is not valid JSON", hints)
+    blocks = data if isinstance(data, list) else [data]
+    if not blocks:
+        raise BlocksInputError("EMPTY_INPUT", "blocks input is an empty JSON array",
+                               ["at least one block object is required"])
+    for i, b in enumerate(blocks):
+        if not isinstance(b, dict):
+            raise BlocksInputError(
+                "BLOCK_NOT_OBJECT",
+                f"blocks[{i}] is {type(b).__name__}, expected a JSON object",
+                ["a blocks payload is an array of block objects: "
+                 '[{"type": "markdown", "text": "..."}, ...]'])
+        if not b.get("type"):
+            raise BlocksInputError(
+                "BLOCK_NO_TYPE", f"blocks[{i}] has no \"type\" field",
+                [f"keys present: {', '.join(sorted(b)) or '(none)'}",
+                 "every Block Kit block needs a type (markdown, table, data_table, "
+                 "card, carousel, section, ...)"])
+    return blocks
+
 
 # --------------------------------------------------------------------------
 # Block builders
 # --------------------------------------------------------------------------
 
 
-def build_table_block(tsv_text, kind="table", align="", caption=""):
+def build_table_block(tsv_text, kind="table", align="", caption="", src=""):
     """kind: 'table' (compact) | 'data_table' (interactive: filter+fullscreen).
-    First TSV line = header. Cells -> raw_text (plain). Tab-separated."""
-    rows = []
-    for line in tsv_text.rstrip("\n").splitlines():
-        cells = [{"type": "raw_text", "text": c} for c in line.split("\t")]
-        if cells:
-            rows.append(cells)
-    if not rows:
-        raise ValueError("empty table input")
+    First TSV line = header. Cells -> raw_text (plain). Tab-separated.
+    Raises TableInputError (ValueError) on any locally-detectable defect."""
+    cells_rows = validate_tsv(tsv_text, kind, src)
+    rows = [[{"type": "raw_text", "text": c} for c in cells] for cells in cells_rows]
     ncols = max(len(r) for r in rows)
     block = {"type": kind, "rows": rows}
     if kind == "data_table":
@@ -74,6 +299,69 @@ def build_table_block(tsv_text, kind="table", align="", caption=""):
                 cs[i] = {"align": _ALIGN[a]}
         block["column_settings"] = cs
     return block, (len(rows), ncols)
+
+
+# --------------------------------------------------------------------------
+# mrkdwn vs Markdown (the two syntaxes are NOT the same, and the CLI mixes both)
+# --------------------------------------------------------------------------
+# `send`/`reply`/`edit` post raw text -> Slack **mrkdwn**: *x* = BOLD, _x_ = italic.
+# `md`/`blocks` post a Block Kit `markdown` block -> ordinary **Markdown**:
+# *x* = ITALIC, **x** = bold.
+# Measured 2026-08-07 by posting `*single* vs **double**` in a markdown block and
+# reading the stored message back: Slack normalized it to
+#   {"text": "single", "style": {"italic": true}} / {"text": "double", "style": {"bold": true}}
+# i.e. mrkdwn-style bold silently collapses to italic — no error, exit 0, and the
+# whole visual hierarchy of a report flattens. Hence: detect and warn (and offer
+# --mrkdwn to convert), never guess silently.
+_CODE_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+# single *span* that is NOT part of **span**, not a `* ` bullet (no space after *)
+_MRKDWN_BOLD_RE = re.compile(r"(?<![\w*])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\w*])")
+_MD_BOLD_RE = re.compile(r"\*\*(?!\s)[^*\n]+?\*\*")
+
+
+def _code_split(text):
+    """Yield (chunk, is_code) — code fences / inline code must never be rewritten."""
+    pos = 0
+    for m in _CODE_RE.finditer(text):
+        if m.start() > pos:
+            yield text[pos:m.start()], False
+        yield m.group(0), True
+        pos = m.end()
+    yield text[pos:], False
+
+
+def mrkdwn_bold_spans(text):
+    """`*spans*` outside code that look like Slack-mrkdwn bold (= Markdown italic)."""
+    return [m.group(0) for chunk, is_code in _code_split(text) if not is_code
+            for m in _MRKDWN_BOLD_RE.finditer(chunk)]
+
+
+def has_markdown_bold(text):
+    return any(_MD_BOLD_RE.search(chunk) for chunk, is_code in _code_split(text)
+               if not is_code)
+
+
+def mrkdwn_to_markdown(text):
+    """*x* -> **x** outside code spans. Leaves existing **x**, `* ` bullets, code."""
+    return "".join(chunk if is_code else _MRKDWN_BOLD_RE.sub(r"**\1**", chunk)
+                   for chunk, is_code in _code_split(text))
+
+
+def mrkdwn_warning(text, convert_flag="--mrkdwn"):
+    """Warning string when the text is mrkdwn-flavoured but is going into a
+    Block Kit `markdown` block; None when it looks like real Markdown."""
+    spans = mrkdwn_bold_spans(text)
+    if not spans or has_markdown_bold(text):
+        return None
+    sample = ", ".join(f"`{s}`" for s in spans[:3])
+    more = f" (+{len(spans) - 3} more)" if len(spans) > 3 else ""
+    fix = (f"rerun with `{convert_flag}` to convert *x* -> **x**, or write **x** "
+           "in the source" if convert_flag else "write **x** for bold in the source")
+    return (f"{len(spans)} single-star span(s) — {sample}{more} — will render as "
+            "ITALIC, not bold: a Block Kit `markdown` block speaks ordinary Markdown "
+            "(bold = **x**), while `slack send/reply/edit` speak Slack mrkdwn "
+            "(bold = *x*). Measured 2026-08-07: Slack stores *x* as style.italic.\n"
+            f"  hint: {fix}")
 
 
 def chunk_markdown(text, lim=MD_LIMIT):
@@ -264,15 +552,21 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    if args.blocks is not None:
-        blocks = json.loads(_read_src(args.blocks))
-        blocks = blocks if isinstance(blocks, list) else [blocks]
-    elif args.table is not None:
-        blk, _ = build_table_block(_read_src(args.table), "table", args.align, args.caption)
-        blocks = [blk]
-    else:
-        blk, _ = build_table_block(_read_src(args.data_table), "data_table", args.align, args.caption)
-        blocks = [blk]
+    try:
+        if args.blocks is not None:
+            blocks = parse_blocks_json(_read_src(args.blocks), args.blocks)
+        elif args.table is not None:
+            blk, _ = build_table_block(_read_src(args.table), "table", args.align,
+                                       args.caption, args.table)
+            blocks = [blk]
+        else:
+            blk, _ = build_table_block(_read_src(args.data_table), "data_table",
+                                       args.align, args.caption, args.data_table)
+            blocks = [blk]
+    except InputError as e:
+        # exit 2 = input validation, nothing sent (same matrix as post_long.py)
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
 
     payload = {"channel": args.channel, "text": args.text or "(blocks)", "blocks": blocks}
     if args.thread:

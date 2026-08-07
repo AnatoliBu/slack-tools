@@ -27,6 +27,8 @@ from typing import Optional
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+import send_blocks as sb  # Block Kit builders + local input validation (exit 2)
+
 # ---------------------------------------------------------------------------
 # Paths / state
 # ---------------------------------------------------------------------------
@@ -661,6 +663,28 @@ def read_text_arg(arg: str) -> str:
             if cand.exists():
                 return cand.read_text(encoding="utf-8")
     return arg
+
+
+def read_text_arg_strict(arg: str, what: str) -> str:
+    """read_text_arg for Block Kit payloads (`table`/`blocks`/`md`), but LOUD when an
+    `@file` fell through as a literal.
+
+    Plain `read_text_arg` returns the argument itself when the file is missing —
+    for `send` that is the documented "inline text" path, but for a TSV/JSON/markdown
+    payload it silently becomes a 1x1 table or a JSON parse error, and the agent only
+    learns about it from Slack's bare `invalid_blocks`.
+    """
+    text = read_text_arg(arg)
+    if arg.startswith("@") and text == arg:
+        tried = ", ".join(str(p) for p in (Path(win_path(arg[1:])), ROOT / arg[1:]))
+        raise sb.InputError(
+            "FILE_NOT_READ",
+            f"`{arg}` was not read as a file — the literal argument would be posted as "
+            f"the whole {what} payload",
+            [f"tried: {tried}",
+             "pipe the file instead: `cat <file> | slack " + what + " <target> -`",
+             "or pass a drive-letter path: `@C:/path/to/file`"])
+    return text
 
 
 def iso_to_epoch(value: str) -> int:
@@ -1632,15 +1656,14 @@ def _wait_file_shared(client, file_id, timeout=20.0):
 
 
 def cmd_table(args):
-    import send_blocks as sb
+    kind = "data_table" if args.data else "table"
+    # Validate BEFORE any network call: a bad TSV must cost zero API round-trips
+    # and must name its own defect (Slack only ever says `invalid_blocks`).
+    block, (nrows, ncols) = sb.build_table_block(
+        read_text_arg_strict(args.src, "table"), kind, args.align, args.caption, args.src)
     client = _make_client()
     channel_id = resolve_target(args.target, client)
     thread_ts = _thread_ts(args.thread)
-    kind = "data_table" if args.data else "table"
-    block, (nrows, ncols) = sb.build_table_block(
-        read_text_arg(args.src), kind, args.align, args.caption)
-    if nrows > 100 or ncols > 20:
-        print(f"WARN: {nrows}x{ncols} exceeds Slack table limit 100x20", file=sys.stderr)
     domain = team_domain(client)
     dest = dest_of(channel_id, thread_ts, client)
     # TASK-001 — slack read: рендерить Block Kit table/data_table в текст (сейчас (table) placeholder) + чинить --js…
@@ -1657,12 +1680,15 @@ def cmd_table(args):
 
 
 def cmd_blocks(args):
+    # same discipline as cmd_table: parse/validate before touching the network
+    blocks = sb.parse_blocks_json(read_text_arg_strict(args.src, "blocks"), args.src)
+    warn = sb.mrkdwn_warning("\n".join(b.get("text", "") for b in blocks
+                                       if b.get("type") == "markdown"), convert_flag=None)
+    if warn:
+        print(f"WARN: {warn}", file=sys.stderr)
     client = _make_client()
     channel_id = resolve_target(args.target, client)
     thread_ts = _thread_ts(args.thread)
-    blocks = json.loads(read_text_arg(args.src))
-    if isinstance(blocks, dict):
-        blocks = [blocks]
     domain = team_domain(client)
     dest = dest_of(channel_id, thread_ts, client)
     resp = _call("chat_postMessage", _client=client, channel=channel_id,
@@ -1681,8 +1707,21 @@ def cmd_md(args):
     """Post a markdown file; each ```mermaid``` fence is rendered to a PNG and posted
     inline as a separator: [md before] -> [PNG] -> [md after]. First message anchors a
     thread; the rest reply into it (use --thread to target an existing thread)."""
-    import send_blocks as sb
-    md = read_text_arg(args.src)
+    md = read_text_arg_strict(args.src, "md")
+    if not md.strip():
+        raise sb.InputError("EMPTY_INPUT", "markdown input is empty — nothing to post",
+                            ["pass text, `@report.md` or `-` (stdin)"])
+    title = args.title or ""
+    # mrkdwn (*bold*) vs Markdown (**bold**) — the block speaks Markdown; say so
+    # BEFORE the first message goes out, not after the whole report is flattened.
+    if getattr(args, "mrkdwn", False):
+        md, title = sb.mrkdwn_to_markdown(md), sb.mrkdwn_to_markdown(title)
+        print("→ --mrkdwn: converted *x* → **x** (Block Kit markdown bold)",
+              file=sys.stderr)
+    else:
+        warn = sb.mrkdwn_warning(md + "\n" + title)
+        if warn:
+            print(f"WARN: {warn}", file=sys.stderr)
     segs = sb.split_md_mermaid(md)
     n_mermaid = sum(1 for k, _ in segs if k == "mermaid")
 
@@ -1699,9 +1738,9 @@ def cmd_md(args):
     dest = dest_of(channel_id, thread_ts, client)
     first_url, n_md, n_png = "", 0, 0
 
-    if args.title and thread_ts is None:   # separate parent announcement; thread the md under it
+    if title and thread_ts is None:   # separate parent announcement; thread the md under it
         pr = _call("chat_postMessage", _client=client, channel=channel_id,
-                   text=args.title[:150], blocks=[{"type": "markdown", "text": args.title}],
+                   text=title[:150], blocks=[{"type": "markdown", "text": title}],
                    thread_ts=None, unfurl_links=False)
         thread_ts = pr["ts"]
         first_url = make_url(domain, channel_id, pr["ts"], None)
@@ -1737,7 +1776,12 @@ def cmd_md(args):
 # argparse
 # ---------------------------------------------------------------------------
 def build_parser():
-    p = argparse.ArgumentParser(prog="slack", description="LP agent-oriented Slack CLI")
+    p = argparse.ArgumentParser(
+        prog="slack", description="LP agent-oriented Slack CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Exit codes: 0=ok  1=Slack API / runtime error  "
+               "2=input rejected locally, nothing sent (table/blocks/md validation)  "
+               "3=bad args (argparse) or `wait` timeout")
     p.add_argument("--json", action="store_true", help="output raw JSON")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -1884,6 +1928,10 @@ def build_parser():
     s.add_argument("--bg", default="white", help="mermaid background (white/transparent)")
     s.add_argument("--title", default="", help="post a parent announcement msg, thread the whole md under it")
     s.add_argument("--thread", help="post into existing thread (ts or URL)")
+    s.add_argument("--mrkdwn", action="store_true",
+                   help="source is written in Slack mrkdwn: convert *x* -> **x** "
+                        "(a markdown block renders *x* as ITALIC; without this flag "
+                        "mrkdwn-looking text only gets a WARN)")
     s.add_argument("--dry-run", action="store_true", help="show segment plan; no send/render")
     s.add_argument("--notify", dest="notify", action="store_true", default=None)
     s.add_argument("--no-notify", dest="notify", action="store_false")
@@ -1962,13 +2010,51 @@ def build_parser():
     return p
 
 
+def api_error_details(response) -> list:
+    """Everything Slack said BESIDES the one-word `error` code.
+
+    `invalid_blocks` alone is undiagnosable; the actual reason lives in
+    `response_metadata.messages` (e.g. `[ERROR] uneven_table_rows_not_allowed
+    [json-pointer:/blocks/0/]`). It used to be visible only under `--json`, which
+    cost three blind sends per diagnosis — always print it now.
+    """
+    out = []
+    try:
+        data = dict(response.data) if hasattr(response, "data") else dict(response)
+    except Exception:  # noqa: BLE001 — never let diagnostics mask the original error
+        return out
+    meta = data.get("response_metadata") or {}
+    for m in meta.get("messages") or []:
+        out.append(str(m))
+    for w in ([meta.get("warnings")] if isinstance(meta.get("warnings"), str)
+              else meta.get("warnings") or []):
+        out.append(f"warning: {w}")
+    for k in ("needed", "provided", "warning", "detail"):
+        if data.get(k):
+            out.append(f"{k}: {data[k]}")
+    return out
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
     try:
         args.func(args)
+    except sb.InputError as e:
+        # exit 2 = input rejected locally, nothing was sent
+        print(f"ERROR: {e}", file=sys.stderr)
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "error": e.code, "message": e.headline,
+                              "hints": e.hints}, ensure_ascii=False, indent=2))
+        sys.exit(2)
     except SlackApiError as e:
         print(f"ERROR: Slack API: {e.response.get('error')}", file=sys.stderr)
+        for line in api_error_details(e.response):
+            print(f"  {line}", file=sys.stderr)
+        if e.response.get("error") == "invalid_blocks":
+            print("  hint: the pointer above (json-pointer:/blocks/N/) names the "
+                  "offending block; `--json` prints the full response",
+                  file=sys.stderr)
         if args.json:
             print(json.dumps(dict(e.response.data), indent=2))
         sys.exit(1)

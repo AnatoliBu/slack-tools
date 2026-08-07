@@ -26,3 +26,4 @@ jobs:
           python test_read_render.py
           python test_commands.py
           python test_find_chromium.py
+          python test_input_validation.py

@@ -86,8 +86,9 @@ slack join #general / slack leave #general
 slack stats #general --top 5                     # top senders, per-day, files/reactions
 slack wait #general --timeout 120                # block for a new message (exit 3 = timeout)
 slack listen #general                            # NDJSON stream of new msgs (polling; no RTM)
-slack table #general @rows.tsv --align l,c,r    # Block Kit table from TSV
+slack table #general @rows.tsv --align l,c,r    # Block Kit table from TSV (input validated locally)
 slack md #general @report.md                    # markdown; ```mermaid``` fences → PNG
+slack md #general @report.md --mrkdwn           # source written in mrkdwn: *x* → **x**
 slack channels --filter eng                     # discovery
 slack me                                         # whoami
 ```
@@ -102,6 +103,16 @@ Run any subcommand with `-h` for full flags. Full reference → [docs/commands.m
 - **URL-first**: paste any Slack archive URL into `read`/`reply`/`edit`/`delete`/`react`;
   channel + ts + thread are parsed for you.
 - **Output**: default `key=value` lines (stable, greppable); `--json` for raw API.
+- **Exit codes**: `0` ok · `1` Slack API / runtime error · `2` input rejected locally,
+  nothing sent · `3` bad args (argparse) or `wait` timeout.
+- **Block Kit input is checked before the network**: `table`/`blocks`/`md` never turn a
+  bad TSV into Slack's bare `invalid_blocks` — the error names the row/column, the limit
+  or the likely producer bug (e.g. `printf '%s'` not expanding `	`) and exits 2 without
+  sending. When the API *does* fail, `response_metadata.messages` is always printed too.
+- **`*bold*` is command-dependent**: `send`/`reply`/`edit` speak Slack mrkdwn (`*bold*`),
+  while `md`/`blocks` post a `markdown` block that speaks ordinary Markdown (`**bold**`,
+  and `*x*` = *italic*). `slack md` warns when the source looks like mrkdwn; `--mrkdwn`
+  converts. Details → [docs/block-kit.md](docs/block-kit.md).
 - **Paths**: MSYS/WSL forms (`/c/Users/..`, `/mnt/c/..`, `/tmp/..`) are normalized
   automatically — no need to hand-feed Windows `C:/` paths.
 - **No silent truncation**: `read` warns on stderr when output hit `--limit`.
@@ -135,6 +146,8 @@ On `401`/expiry the CLI tries, in order:
 python test_win_path.py       # path normalization (10)
 python test_read_render.py    # table render, --json placement, multi-file upload (8)
 python test_commands.py       # forward/members/pin/join/schedule/stats/wait/listen (21)
+python test_input_validation.py  # table/blocks/md input rules, mrkdwn-vs-Markdown (41)
+python test_find_chromium.py  # chromium discovery for mermaid rendering (14)
 ```
 
 No pytest required — each file runs standalone (exit 0 = pass) and in CI on every push.
