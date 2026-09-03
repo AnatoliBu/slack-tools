@@ -319,6 +319,65 @@ def test_listen_emits_ndjson_for_new_messages():
     assert rec["channel"] == CHAN
 
 
+# --- a message URL as target means "into that thread" for every write command ------
+# Regression: `md`/`table`/`blocks` had no URL->thread branch, so a thread URL silently
+# degraded to "just the channel" and the post landed top-level with exit 0. Measured
+# 2026-09-03 on a real report: six replies became six channel messages.
+
+_THREAD_URL = f"https://{WS}/archives/{CHAN}/p1788271903629669"
+_THREAD_TS = "1788271903.629669"
+
+
+def test_url_target_resolves_to_its_thread():
+    fake = FakeClient({"conversations_info": _CHAN_INFO, "team_info": _TEAM})
+    channel_id, thread_ts = s.resolve_target_and_thread(_THREAD_URL, None, fake)
+    assert channel_id == CHAN, channel_id
+    assert thread_ts == _THREAD_TS, thread_ts
+
+
+def test_explicit_thread_flag_wins_over_the_target_url():
+    fake = FakeClient({"conversations_info": _CHAN_INFO, "team_info": _TEAM})
+    other = f"https://{WS}/archives/{CHAN}/p1700000000000123"
+    _, thread_ts = s.resolve_target_and_thread(other, _THREAD_URL, fake)
+    assert thread_ts == _THREAD_TS, thread_ts
+
+
+def test_plain_channel_target_stays_top_level():
+    fake = FakeClient({"conversations_info": _CHAN_INFO, "team_info": _TEAM})
+    _, thread_ts = s.resolve_target_and_thread(CHAN, None, fake)
+    assert thread_ts is None, thread_ts
+
+
+def _post_with_url_target(cmd_name, argv):
+    """Runs a write command whose client is built internally, against a FakeClient."""
+    fake = FakeClient({"conversations_info": _CHAN_INFO, "team_info": _TEAM,
+                       "chat_postMessage": {"ts": "1788433644.134379"}})
+    original = s._make_client
+    s._make_client = lambda *a, **kw: fake
+    try:
+        _capture(getattr(s, "cmd_" + cmd_name), _args(*argv))
+    finally:
+        s._make_client = original
+    return fake
+
+
+def test_table_with_url_target_posts_into_the_thread():
+    tsv = chr(9).join(("a", "b")) + chr(10) + chr(9).join(("c", "d"))
+    fake = _post_with_url_target("table", ("table", _THREAD_URL, tsv, "--no-notify"))
+    assert fake.last("chat_postMessage")["thread_ts"] == _THREAD_TS
+
+
+def test_blocks_with_url_target_posts_into_the_thread():
+    payload = '[{"type": "markdown", "text": "x"}]'
+    fake = _post_with_url_target("blocks", ("blocks", _THREAD_URL, payload, "--no-notify"))
+    assert fake.last("chat_postMessage")["thread_ts"] == _THREAD_TS
+
+
+def test_md_with_url_target_posts_into_the_thread():
+    fake = _post_with_url_target("md", ("md", _THREAD_URL, "**report**", "--no-notify"))
+    assert fake.last("chat_postMessage")["thread_ts"] == _THREAD_TS
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

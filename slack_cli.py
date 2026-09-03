@@ -745,14 +745,7 @@ def iso_to_epoch(value: str) -> int:
 
 def cmd_send(args, client=None):
     client = client or _make_client()
-    channel_id = resolve_target(args.target, client)
-    thread_ts = None
-    if args.thread:
-        if "slack.com/archives/" in args.thread:
-            _, parent_ts, url_thread = parse_url(args.thread)
-            thread_ts = url_thread or parent_ts
-        else:
-            thread_ts = args.thread
+    channel_id, thread_ts = resolve_target_and_thread(args.target, args.thread, client)
     text = read_text_arg(args.text)
     dest = dest_of(channel_id, thread_ts, client)
     domain = team_domain(client)
@@ -1095,11 +1088,9 @@ def cmd_read(args):
 
 def cmd_upload(args):
     client = _make_client()
-    channel_id = resolve_target(args.target, client)
     # thread из --thread, иначе из самой target-ссылки (если это URL с thread_ts/на родителя треда)
-    thread_ts = _thread_ts(getattr(args, "thread", None))
-    if not thread_ts and isinstance(args.target, str) and "slack.com/archives/" in args.target:
-        thread_ts = _thread_ts(args.target)
+    channel_id, thread_ts = resolve_target_and_thread(
+        args.target, getattr(args, "thread", None), client)
     files = args.file if isinstance(args.file, list) else [args.file]
     kw = dict(initial_comment=args.comment or "")
     # один файл → file=; несколько → file_uploads=[...] (один пост с N вложениями,
@@ -1799,6 +1790,25 @@ def _thread_ts(thread):
     return thread
 
 
+def resolve_target_and_thread(target, thread, client):
+    """target ('#chan' / '@user' / 'C123' / message URL) + --thread → (channel_id, thread_ts).
+
+    A message URL as the target means "post into that thread" for EVERY write command.
+    `send` and `upload` each hand-rolled this; `md`, `table` and `blocks` had no such
+    branch at all, so a thread URL silently degraded to "just the channel" and the post
+    landed top-level with exit 0 (measured 2026-09-03: six report replies became six
+    channel messages and had to be deleted and re-posted). One helper, one behaviour.
+
+    An explicit --thread still wins over the target — that is how a report is posted into
+    a thread that is not the one the target URL points at.
+    """
+    channel_id = resolve_target(target, client)
+    thread_ts = _thread_ts(thread)
+    if not thread_ts and isinstance(target, str) and "slack.com/archives/" in target:
+        thread_ts = _thread_ts(target)
+    return channel_id, thread_ts
+
+
 def _notify_if_channel(args, client, dest, urls):
     flag = args.notify if getattr(args, "notify", None) is not None else _should_notify_channels()
     if urls and dest.is_channel_like and flag:
@@ -1830,8 +1840,7 @@ def cmd_table(args):
     block, (nrows, ncols) = sb.build_table_block(
         read_text_arg_strict(args.src, "table"), kind, args.align, args.caption, args.src)
     client = _make_client()
-    channel_id = resolve_target(args.target, client)
-    thread_ts = _thread_ts(args.thread)
+    channel_id, thread_ts = resolve_target_and_thread(args.target, args.thread, client)
     domain = team_domain(client)
     dest = dest_of(channel_id, thread_ts, client)
     # TASK-001 — slack read: рендерить Block Kit table/data_table в текст (сейчас (table) placeholder) + чинить --js…
@@ -1843,7 +1852,8 @@ def cmd_table(args):
     save_last(channel_id, ts, thread_ts)
     audit("table", dest=dest.kind, name=dest.name, channel=channel_id, kind=kind, url=url)
     _notify_if_channel(args, client, dest, [url])
-    print(f"→ dest={dest.kind} {dest.name} ({kind} {nrows}x{ncols})", file=sys.stderr)
+    print(f"→ dest={dest.kind} {dest.name} ({kind} {nrows}x{ncols})"
+          f"{' (threaded)' if thread_ts else ' (flat)'}", file=sys.stderr)
     emit({"ts": ts, "url": url, "kind": kind, "rows": nrows, "cols": ncols}, args.json)
 
 
@@ -1855,8 +1865,7 @@ def cmd_blocks(args):
     if warn:
         print(f"WARN: {warn}", file=sys.stderr)
     client = _make_client()
-    channel_id = resolve_target(args.target, client)
-    thread_ts = _thread_ts(args.thread)
+    channel_id, thread_ts = resolve_target_and_thread(args.target, args.thread, client)
     domain = team_domain(client)
     dest = dest_of(channel_id, thread_ts, client)
     resp = _call("chat_postMessage", _client=client, channel=channel_id,
@@ -1867,7 +1876,8 @@ def cmd_blocks(args):
     save_last(channel_id, ts, thread_ts)
     audit("blocks", dest=dest.kind, name=dest.name, channel=channel_id, n=len(blocks), url=url)
     _notify_if_channel(args, client, dest, [url])
-    print(f"→ dest={dest.kind} {dest.name} ({len(blocks)} blocks)", file=sys.stderr)
+    print(f"→ dest={dest.kind} {dest.name} ({len(blocks)} blocks)"
+          f"{' (threaded)' if thread_ts else ' (flat)'}", file=sys.stderr)
     emit({"ts": ts, "url": url, "blocks": len(blocks)}, args.json)
 
 
@@ -1900,8 +1910,7 @@ def cmd_md(args):
         return
 
     client = _make_client()
-    channel_id = resolve_target(args.target, client)
-    thread_ts = _thread_ts(args.thread)   # default None → flat sequence of top-level messages
+    channel_id, thread_ts = resolve_target_and_thread(args.target, args.thread, client)
     domain = team_domain(client)
     dest = dest_of(channel_id, thread_ts, client)
     first_url, n_md, n_png = "", 0, 0
