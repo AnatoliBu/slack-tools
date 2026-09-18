@@ -143,3 +143,59 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+import send_blocks as sb
+
+# --- note-cli frontmatter -> компактная шапка -----------------------------------------------
+#
+# Заметка реестра постится в Slack КАК ЕСТЬ (`slack md @_docs/bugs/BUG-NNN-*.md`), но её YAML-шапка
+# адресована гейтам: schema_version, fingerprint, body_hash, sessions, aliases. Замер 2026-09-18 на
+# BUG-219: 24 строки frontmatter против трёх полезных, и сам дефект уезжал ниже первого экрана.
+
+def test_note_frontmatter_folds_into_one_header_line():
+    md = (
+        "---\n"
+        "id: BUG-219\n"
+        "schema_version: 2\n"
+        "status: OPEN\n"
+        "severity: P2\n"
+        "title: 'BUG-219: validation-service отдаёт сырой ключ'\n"
+        "fingerprint: 17f36119\n"
+        "body_hash: 152c2b1d\n"
+        "side: server\n"
+        "---\n"
+        "\n## Описание\nтело\n"
+    )
+    out, note_id = sb.note_to_post(md)
+    assert note_id == "BUG-219"
+    assert out.splitlines()[0] == "*BUG-219 · P2 · server*"
+    assert out.splitlines()[1] == "validation-service отдаёт сырой ключ"   # префикс ID не дублируется
+    assert "fingerprint" not in out and "body_hash" not in out and "schema_version" not in out
+    assert "## Описание" in out and "тело" in out
+
+
+def test_not_a_note_is_returned_unchanged():
+    """Обычный markdown-отчёт трогать нельзя — у него нет id и шапку выдумывать не из чего."""
+    md = "# Отчёт\n\nтекст\n"
+    assert sb.note_to_post(md) == (md, None)
+
+
+def test_yaml_without_note_id_is_left_alone():
+    """Frontmatter бывает не только у заметок (jekyll и прочее) — без `id` не трогаем."""
+    md = "---\nlayout: post\ntitle: Hello\n---\n\nтело\n"
+    assert sb.note_to_post(md) == (md, None)
+
+
+def test_undetermined_side_is_not_printed():
+    """`side: undetermined` — честное «не доказано», в шапку поста ему нечего добавить."""
+    md = "---\nid: TASK-469\nstatus: TODO\nseverity: P2\nside: undetermined\ntitle: 'TASK-469: заголовок'\n---\n\nтело\n"
+    out, _ = sb.note_to_post(md)
+    assert out.splitlines()[0] == "*TASK-469 · P2 · TODO*"
+
+
+def test_open_status_is_not_noise_in_the_header():
+    """OPEN — состояние по умолчанию; печатать его в каждой шапке значит печатать шум."""
+    md = "---\nid: BUG-230\nstatus: OPEN\nseverity: P2\nside: server\ntitle: 'BUG-230: заголовок'\n---\n\nтело\n"
+    out, _ = sb.note_to_post(md)
+    assert out.splitlines()[0] == "*BUG-230 · P2 · server*"

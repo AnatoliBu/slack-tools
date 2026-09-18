@@ -1889,6 +1889,15 @@ def cmd_md(args):
     if not md.strip():
         raise sb.InputError("EMPTY_INPUT", "markdown input is empty — nothing to post",
                             ["pass text, `@report.md` or `-` (stdin)"])
+    # Заметка note-cli постится как есть, но её YAML-шапка адресована гейтам, не читателю:
+    # по умолчанию она сворачивается в строку `*<ID> · <severity> · <side>*` + заголовок.
+    # `--keep-frontmatter` возвращает прежнее поведение (YAML уезжает в пост дословно).
+    if not getattr(args, "keep_frontmatter", False):
+        md, note_id = sb.note_to_post(md)
+        if note_id:
+            print(f"→ note {note_id}: YAML-шапка свёрнута в строку заголовка "
+                  f"(--keep-frontmatter оставит её дословно)", file=sys.stderr)
+
     title = args.title or ""
     # mrkdwn (*bold*) vs Markdown (**bold**) — the block speaks Markdown; say so
     # BEFORE the first message goes out, not after the whole report is flattened.
@@ -2109,6 +2118,9 @@ def build_parser():
                    help="source is written in Slack mrkdwn: convert *x* -> **x** "
                         "(a markdown block renders *x* as ITALIC; without this flag "
                         "mrkdwn-looking text only gets a WARN)")
+    s.add_argument("--keep-frontmatter", action="store_true",
+                   help="post a note-cli YAML frontmatter verbatim; by default it is folded "
+                        "into one header line `*<ID> · <severity> · <side>*` + title")
     s.add_argument("--dry-run", action="store_true", help="show segment plan; no send/render")
     s.add_argument("--notify", dest="notify", action="store_true", default=None)
     s.add_argument("--no-notify", dest="notify", action="store_false")
