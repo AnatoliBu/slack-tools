@@ -147,55 +147,42 @@ if __name__ == "__main__":
 
 import send_blocks as sb
 
-# --- note-cli frontmatter -> компактная шапка -----------------------------------------------
+# --- note-cli: YAML снимается, шапка НЕ сочиняется --------------------------------------------
 #
-# Заметка реестра постится в Slack КАК ЕСТЬ (`slack md @_docs/bugs/BUG-NNN-*.md`), но её YAML-шапка
-# адресована гейтам: schema_version, fingerprint, body_hash, sessions, aliases. Замер 2026-09-18 на
-# BUG-219: 24 строки frontmatter против трёх полезных, и сам дефект уезжал ниже первого экрана.
+# Заметка реестра постится в Slack КАК ЕСТЬ. Снимается только YAML (он для гейтов: schema_version,
+# fingerprint, body_hash, sessions, aliases — 24 строки против трёх полезных, замер на BUG-219).
+# Заметная строка «пин · BUG-NNN · P1 · server» живёт В ФАЙЛЕ, первой строкой тела, и тул её не
+# трогает — решение владельца 2026-09-18: «надо в изначальном файле чтобы было, а слак тулс просто
+# постил».
 
-def test_note_frontmatter_folds_into_one_header_line():
-    md = (
-        "---\n"
-        "id: BUG-219\n"
-        "schema_version: 2\n"
-        "status: OPEN\n"
-        "severity: P2\n"
-        "title: 'BUG-219: validation-service отдаёт сырой ключ'\n"
-        "fingerprint: 17f36119\n"
-        "body_hash: 152c2b1d\n"
-        "side: server\n"
-        "---\n"
-        "\n## Описание\nтело\n"
-    )
+HEADER_LINE = "📌 · BUG-219 · P2 · server"
+
+
+def test_yaml_is_stripped_and_body_keeps_its_own_header():
+    md = ("---@id: BUG-219@schema_version: 2@fingerprint: 17f36119@body_hash: 152c2b1d@---@@"
+          + HEADER_LINE + "@validation-service отдаёт сырой ключ@@## Описание@тело@").replace("@", chr(10))
     out, note_id = sb.note_to_post(md)
     assert note_id == "BUG-219"
-    assert out.splitlines()[0] == "*BUG-219 · P2 · server*"
-    assert out.splitlines()[1] == "validation-service отдаёт сырой ключ"   # префикс ID не дублируется
-    assert "fingerprint" not in out and "body_hash" not in out and "schema_version" not in out
-    assert "## Описание" in out and "тело" in out
+    assert out.splitlines()[0] == HEADER_LINE          # взято ИЗ ФАЙЛА, не собрано тулом
+    for gate_field in ("fingerprint", "body_hash", "schema_version"):
+        assert gate_field not in out
+
+
+def test_the_tool_invents_no_header():
+    """Нет шапки в файле — тул её не добавляет: пост начинается тем же, чем тело заметки."""
+    md = ("---@id: BUG-230@severity: P2@side: server@title: 'BUG-230: заголовок'@---@@"
+          "## Описание@тело@").replace("@", chr(10))
+    out, _ = sb.note_to_post(md)
+    assert out.startswith("## Описание")
+    assert "BUG-230" not in out and "P2" not in out
 
 
 def test_not_a_note_is_returned_unchanged():
-    """Обычный markdown-отчёт трогать нельзя — у него нет id и шапку выдумывать не из чего."""
-    md = "# Отчёт\n\nтекст\n"
+    md = ("# Отчёт@@текст@").replace("@", chr(10))
     assert sb.note_to_post(md) == (md, None)
 
 
 def test_yaml_without_note_id_is_left_alone():
     """Frontmatter бывает не только у заметок (jekyll и прочее) — без `id` не трогаем."""
-    md = "---\nlayout: post\ntitle: Hello\n---\n\nтело\n"
+    md = ("---@layout: post@title: Hello@---@@тело@").replace("@", chr(10))
     assert sb.note_to_post(md) == (md, None)
-
-
-def test_undetermined_side_is_not_printed():
-    """`side: undetermined` — честное «не доказано», в шапку поста ему нечего добавить."""
-    md = "---\nid: TASK-469\nstatus: TODO\nseverity: P2\nside: undetermined\ntitle: 'TASK-469: заголовок'\n---\n\nтело\n"
-    out, _ = sb.note_to_post(md)
-    assert out.splitlines()[0] == "*TASK-469 · P2 · TODO*"
-
-
-def test_open_status_is_not_noise_in_the_header():
-    """OPEN — состояние по умолчанию; печатать его в каждой шапке значит печатать шум."""
-    md = "---\nid: BUG-230\nstatus: OPEN\nseverity: P2\nside: server\ntitle: 'BUG-230: заголовок'\n---\n\nтело\n"
-    out, _ = sb.note_to_post(md)
-    assert out.splitlines()[0] == "*BUG-230 · P2 · server*"

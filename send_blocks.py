@@ -341,24 +341,24 @@ def has_markdown_bold(text):
                if not is_code)
 
 
-# --- note-cli frontmatter -> компактная шапка поста ------------------------------------------
+# --- note-cli: снять YAML-шапку перед постингом -----------------------------------------------
 #
-# ЗАЧЕМ. Заметка реестра (note-cli: _docs/bugs/BUG-NNN-*.md и соседи) — обычный markdown, и её
-# постят в Slack КАК ЕСТЬ, без ручной вёрстки. Но её YAML-шапка предназначена гейтам, а не
-# читателю: `schema_version`, `fingerprint`, `body_hash`, `sessions`, `aliases`, `updated_at` — в
-# посте это мусор на пол-экрана, за которым теряется сам дефект (замер 2026-09-18: 24 строки
-# frontmatter против 3 полезных).
+# ЗАЧЕМ. Заметка реестра (note-cli: `_docs/bugs/BUG-NNN-*.md` и соседи) — обычный markdown, и её
+# постят в Slack КАК ЕСТЬ, без ручной вёрстки. Но YAML-шапка адресована гейтам, а не читателю:
+# `schema_version`, `fingerprint`, `body_hash`, `sessions`, `aliases`, `updated_at` — в посте это
+# 24 строки мусора перед первой полезной (замер 2026-09-18 на BUG-219), за которыми теряется сам
+# дефект. Поэтому она снимается.
 #
-# Поэтому frontmatter не печатается, а СВОРАЧИВАЕТСЯ в одну строку по правилу формата репортов
-# (`~/.claude/skills/slack/references/report_format.md`): `*<ID> · <severity> · <тип>*` первым
-# токеном строки — в треде видны только первые символы, и по ним должно быть понятно, что это.
-# Заголовок идёт второй строкой.
+# ⛔ И ровно на этом роль тула КОНЧАЕТСЯ — шапку поста он НЕ сочиняет (решение владельца
+# 2026-09-18, дословно: «надо в изначальном файле чтобы было, а слак тулс просто постил»).
+# Заметная строка вида `📌 · BUG-NNN · P1 · server` пишется В САМОЙ ЗАМЕТКЕ первой строкой тела:
+# так файл самодостаточен и одинаково читается в git, в Obsidian и в Slack, а тул остаётся тупым
+# транспортом. Прежняя редакция здесь собирала шапку из frontmatter — отвергнута: она существовала
+# только в момент постинга, и тот же файл в репозитории выглядел иначе, чем у получателя.
 #
-# ⛔ Ничего не додумывает: если поля нет — оно просто не попадает в шапку. Если текст вообще не
-# заметка (нет frontmatter или в нём нет `id`) — возвращается как был, без изменений.
+# Текст без frontmatter или с YAML без note-`id` возвращается как был, без изменений.
 
 _NOTE_ID_RE = re.compile(r"^(BUG|TASK|S|OPENQ|TEST|REQ)-", re.I)
-
 
 def _fm_scalars(head):
     """Скаляры верхнего уровня из YAML-шапки. Ручной скан: нам нужны четыре поля,
@@ -387,23 +387,7 @@ def note_to_post(md):
     if not note_id or not _NOTE_ID_RE.match(note_id):
         return md, None
 
-    body = md[end + 4:].lstrip("\n")
-    bits = [note_id]
-    for key in ("severity", "side"):
-        val = meta.get(key)
-        if val and val.lower() not in ("undetermined", "none", "null", "-"):
-            bits.append(val)
-    status = meta.get("status")
-    if status and status.upper() not in ("OPEN",):
-        bits.append(status)
-
-    title = meta.get("title", "")
-    # note-cli пишет title как "BUG-219: текст" — префикс уже в шапке, не дублируем.
-    if title.startswith(note_id + ":"):
-        title = title[len(note_id) + 1:].strip()
-
-    header = "*" + " · ".join(bits) + "*"
-    return "\n".join(x for x in (header, title, "", body) if x is not None), note_id
+    return md[end + 4:].lstrip("\n"), note_id
 
 
 def mrkdwn_to_markdown(text):
