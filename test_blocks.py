@@ -186,3 +186,37 @@ def test_yaml_without_note_id_is_left_alone():
     """Frontmatter бывает не только у заметок (jekyll и прочее) — без `id` не трогаем."""
     md = ("---@layout: post@title: Hello@---@@тело@").replace("@", chr(10))
     assert sb.note_to_post(md) == (md, None)
+
+
+# --- chunk_markdown: разрез не рвёт code fence -------------------------------------------------
+
+def _texts(blocks):
+    return [b["text"] for b in blocks]
+
+
+def test_split_inside_code_fence_closes_and_reopens():
+    """Длинный ```-блок на границе chunk'а: хвост закрыт, продолжение открыто заново с языком."""
+    body = "\n".join(f"line {i} " + "x" * 40 for i in range(40))
+    md = "интро\n\n```python\n" + body + "\n```\n"
+    blocks = _texts(sb.chunk_markdown(md, lim=500))
+    assert len(blocks) > 1
+    for t in blocks:
+        assert t.count("```") % 2 == 0, t
+    assert blocks[0].rstrip().endswith("```")
+    for t in blocks[1:]:
+        assert t.startswith("```python")
+
+
+def test_no_fence_split_unchanged():
+    md = "\n".join(f"строка {i}" for i in range(50))
+    blocks = _texts(sb.chunk_markdown(md, lim=200))
+    assert "```" not in "".join(blocks)
+    assert "\n".join(blocks).replace("\n", "") == md.replace("\n", "")
+
+
+def test_closed_fence_is_not_reopened():
+    """Fence, закрывшийся до границы, не должен тащиться в следующий chunk."""
+    md = "```\ncode\n```\n" + "\n".join(f"текст {i}" for i in range(60))
+    blocks = _texts(sb.chunk_markdown(md, lim=120))
+    assert blocks[0].count("```") == 2
+    assert all("```" not in t for t in blocks[1:])

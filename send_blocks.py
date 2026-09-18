@@ -413,16 +413,54 @@ def mrkdwn_warning(text, convert_flag="--mrkdwn"):
             f"  hint: {fix}")
 
 
+_FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*(\S.*)?$")
+
+
+def _fence_open(line, cur):
+    """Состояние fence после строки `line`: (marker, info) или None.
+
+    `cur` — состояние ДО строки. Закрывает только маркер того же символа и не
+    короче открывающего, без info-строки (правило CommonMark).
+    """
+    m = _FENCE_RE.match(line.rstrip("\n"))
+    if not m:
+        return cur
+    marker, info = m.group(1), (m.group(2) or "").strip()
+    if cur is None:
+        return (marker, info)
+    open_marker, _ = cur
+    if marker[0] == open_marker[0] and len(marker) >= len(open_marker) and not info:
+        return None
+    return cur
+
+
 def chunk_markdown(text, lim=MD_LIMIT):
-    """Split text into <=lim chunks at line boundaries -> markdown blocks."""
-    chunks, cur = [], ""
+    """Split text into <=lim chunks at line boundaries -> markdown blocks.
+
+    ⚠ Разрез НЕ должен рвать открытый ```code``` fence: Slack рендерит каждый chunk
+    отдельным markdown-блоком, поэтому незакрытый fence в хвосте первого блока теряет
+    моноширинное оформление, а продолжение во втором блоке едет как обычный текст
+    (замер 2026-09-18 на длинной заметке note-cli). Рвём — закрываем fence в текущем
+    chunk и открываем заново тем же маркером и info-строкой в следующем.
+    """
+    chunks, cur, fence = [], "", None
     for line in text.splitlines(keepends=True):
+        nxt = _fence_open(line, fence)
         if cur and len(cur) + len(line) > lim:
-            chunks.append(cur)
-            cur = line
+            if fence:
+                marker, info = fence
+                cur += ("" if cur.endswith("\n") else "\n") + marker + "\n"
+                chunks.append(cur)
+                cur = f"{marker}{info}\n" + line
+            else:
+                chunks.append(cur)
+                cur = line
         else:
             cur += line
+        fence = nxt
     if cur.strip():
+        if fence:
+            cur += ("" if cur.endswith("\n") else "\n") + fence[0] + "\n"
         chunks.append(cur)
     return [{"type": "markdown", "text": c.rstrip("\n") or " "} for c in chunks]
 
