@@ -1843,6 +1843,119 @@ def cmd_wait(args, client=None):
     sys.exit(3)
 
 
+def _subs_path() -> Path:
+    """Thread subscriptions live next to the other caches (module global, so tests redirect it)."""
+    return CACHE_DIR / "subscriptions.json"
+
+
+def _load_subs() -> dict:
+    return _load_cache(_subs_path())
+
+
+def _save_subs(subs: dict) -> None:
+    _save_cache(_subs_path(), subs)
+
+
+def _sub_keys_for(targets: list[str], subs: dict) -> list[str]:
+    """Subscription keys matching URLs or labels; unknown target → usage error."""
+    keys = []
+    for t in targets:
+        tts = _thread_ts(t)
+        hit = [k for k, v in subs.items() if t in (v.get("url"), v.get("label"), k)
+               or (tts and k.endswith(f":{tts}"))]
+        if not hit:
+            print(f"[error] not subscribed: {t}", file=sys.stderr)
+            sys.exit(2)
+        keys.extend(hit)
+    return keys
+
+
+def cmd_subscribe(args, client=None):
+    """Subscribe to a thread: remember it and its latest reply as already seen."""
+    client = client or _make_client()
+    channel_id, thread_ts = resolve_target_and_thread(args.target, None, client)
+    if not thread_ts:
+        print("[error] subscribe needs a message or thread URL, not a channel", file=sys.stderr)
+        sys.exit(2)
+    subs = _load_subs()
+    key = f"{channel_id}:{thread_ts}"
+    subs[key] = {"channel": channel_id, "thread_ts": thread_ts, "url": args.target,
+                 "label": args.label or thread_ts,
+                 "last_ts": _thread_latest_ts(channel_id, thread_ts, client)}
+    _save_subs(subs)
+    emit({"ok": True, "subscribed": key, "label": subs[key]["label"],
+          "last_ts": subs[key]["last_ts"]}, args.json)
+
+
+def cmd_unsubscribe(args, client=None):
+    subs = _load_subs()
+    for key in _sub_keys_for(args.targets, subs):
+        subs.pop(key, None)
+    _save_subs(subs)
+    emit({"ok": True, "left": len(subs)}, args.json)
+
+
+def cmd_subscriptions(args, client=None):
+    subs = _load_subs()
+    if args.json:
+        emit_json([{"key": k, **v} for k, v in subs.items()])
+        return
+    if not subs:
+        print("(no subscriptions)", file=sys.stderr)
+    for v in subs.values():
+        print(f"{v.get('label')}\t{v.get('url')}\tseen={v.get('last_ts')}")
+
+
+def cmd_watch(args, client=None):
+    """Watch subscribed threads; exit 0 on the first new replies (the exit IS the notification).
+
+    Each reply that was read advances the thread's seen mark, so the next `watch` continues
+    where this one stopped. Own messages advance the mark but do not notify (--include-self).
+    `--follow` keeps printing instead of exiting. `--timeout 0` = one pass.
+    Exit: 0 — new replies printed · 2 — nothing subscribed / unknown target · 3 — timeout.
+    """
+    subs = _load_subs()
+    keys = _sub_keys_for(args.targets, subs) if args.targets else list(subs)
+    if not keys:
+        print("[error] no subscriptions — `slack subscribe <thread URL>` first", file=sys.stderr)
+        sys.exit(2)
+    client = client or _make_client()
+    me = None if args.include_self else _call("auth_test", _client=client).get("user_id")
+    deadline = time.time() + args.timeout
+    while True:
+        found = []
+        for key in keys:
+            sub = subs[key]
+            resp = _call("conversations_replies", _client=client, channel=sub["channel"],
+                         ts=sub["thread_ts"], oldest=sub["last_ts"], limit=200)
+            new = sorted((m for m in resp.get("messages", []) or []
+                          if m.get("ts", "0") > sub["last_ts"]), key=lambda m: m.get("ts", "0"))
+            if not new:
+                continue
+            sub["last_ts"] = new[-1]["ts"]
+            shown = [m for m in new if not me or (m.get("user") or m.get("bot_id")) != me]
+            if shown:
+                found.append((sub, shown))
+        _save_subs(subs)
+        if found:
+            if args.json:
+                emit_json([{"label": sub["label"], "url": sub["url"], "messages": msgs}
+                           for sub, msgs in found])
+            else:
+                for sub, msgs in found:
+                    print(f"=== {sub['label']}  {sub['url']}")
+                    _print_new_messages(msgs, sub["channel"], client, False)
+            sys.stdout.flush()
+            if not args.follow:
+                return
+        if time.time() >= deadline:
+            break
+        time.sleep(min(args.interval, max(0.0, deadline - time.time())))
+    print(f"[timeout] no new replies in {len(keys)} subscribed thread(s) within {args.timeout}s",
+          file=sys.stderr)
+    sys.exit(3)
+
+
 def cmd_listen(args, client=None):
     """Infinite poll: print each new message as one NDJSON line (Ctrl-C to stop).
 
@@ -2309,6 +2422,27 @@ def build_parser():
                    help="baseline ts (default: current latest message)")
     s.add_argument("--limit", type=int, default=50)
     s.set_defaults(func=cmd_wait)
+
+    s = addp("subscribe", help="subscribe to a thread (its latest reply counts as seen)")
+    s.add_argument("target", help="message or thread URL")
+    s.add_argument("--label", help="short name shown by watch (e.g. PLAT-4731)")
+    s.set_defaults(func=cmd_subscribe)
+
+    s = addp("unsubscribe", help="drop thread subscriptions by URL or label")
+    s.add_argument("targets", nargs="+")
+    s.set_defaults(func=cmd_unsubscribe)
+
+    s = addp("subscriptions", help="list subscribed threads (label, url, seen mark)")
+    s.set_defaults(func=cmd_subscriptions)
+
+    s = addp("watch", help="wait for new replies in subscribed threads; exit 0 = notification")
+    s.add_argument("targets", nargs="*", help="only these subscriptions (URL or label); default all")
+    s.add_argument("--timeout", type=float, default=6900.0,
+                   help="seconds before exit 3 (default 6900 — under a 2h background slot); 0 = one pass")
+    s.add_argument("--interval", type=float, default=60.0, help="poll interval seconds")
+    s.add_argument("--follow", action="store_true", help="keep printing instead of exiting on news")
+    s.add_argument("--include-self", action="store_true", help="own messages notify too")
+    s.set_defaults(func=cmd_watch)
 
     s = addp("listen", help="infinite poll → new messages as NDJSON (xoxc: no RTM/Socket)")
     s.add_argument("target")

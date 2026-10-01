@@ -88,6 +88,8 @@ slack wait #general --timeout 120                # block for a new message (exit
 slack wait <thread URL> --from U0B2YLD53QU --while-contains ":processing:" --timeout 1800
                                                  # in a thread; one author; until the bot's message is finished
 slack listen #general                            # NDJSON stream of new msgs (polling; no RTM)
+slack subscribe <thread URL> --label PLAT-4731   # follow a thread; `subscriptions`, `unsubscribe`
+slack watch                                      # exit 0 on the first new replies in subscribed threads
 slack contacts --without-dm --filter ivan        # everyone + dm=<D-id>/no-dm; --with-dm, --bots
 slack invite #general @bob U0B2YLD53QU           # add people or bots to a channel
 slack table #general @rows.tsv --align l,c,r    # Block Kit table from TSV (input validated locally)
@@ -158,7 +160,7 @@ On `401`/expiry the CLI tries, in order:
 python test_win_path.py       # path normalization (10)
 python test_read_render.py    # table render, --json placement, multi-file upload (8)
 python test_read_blocks.py    # rich_text/table render, blocks-over-fallback, one-JSON-doc (29)
-python test_commands.py       # forward/members/pin/join/schedule/stats/wait (thread, --from, --while-contains)/listen/contacts/invite (34)
+python test_commands.py       # forward/members/pin/join/schedule/stats/wait (thread, --from, --while-contains)/listen/contacts/invite/subscribe/watch (40)
 python test_input_validation.py  # table/blocks/md input rules, mrkdwn-vs-Markdown (41)
 python test_find_chromium.py  # chromium discovery for mermaid rendering (14)
 ```

@@ -132,6 +132,98 @@ def test_invite_resolves_names_and_bot_ids():
     assert call["users"] == "U0000000B2,U0B2YLD53QU"
 
 
+# --- thread subscriptions: subscribe / subscriptions / unsubscribe / watch -----
+# Owner request 2026-10-01: "subscribe to a thread and get notifications from it".
+# Agent pattern: `slack watch` in the background exits 0 on the first new replies —
+# the exit is the notification; the seen-mark advances, so the next run continues.
+
+SUB_URL = f"https://{WS}/archives/{CHAN}/p1700000100000000"
+SUB_URL2 = f"https://{WS}/archives/{CHAN}/p1700000500000000"
+ME = "U0000000ME"
+
+
+def _fresh_subs():
+    p = s._subs_path()
+    if p.exists():
+        p.unlink()
+
+
+def _thread(*msgs):
+    return lambda **kw: {"messages": [m for m in msgs if m["ts"] > kw.get("oldest", "0")
+                                      or "oldest" not in kw]}
+
+
+def test_subscribe_stores_thread_with_latest_reply_as_seen():
+    _fresh_subs()
+    fake = FakeClient({"conversations_replies": _thread(
+        {"ts": "1700000100.000000", "user": "U1"}, {"ts": "1700000150.000000", "user": "U2"})})
+    _capture(s.cmd_subscribe, _args("subscribe", SUB_URL, "--label", "PLAT-4731"), client=fake)
+    subs = s._load_subs()
+    assert len(subs) == 1
+    sub = next(iter(subs.values()))
+    assert sub["channel"] == CHAN and sub["thread_ts"] == "1700000100.000000"
+    assert sub["last_ts"] == "1700000150.000000" and sub["label"] == "PLAT-4731"
+
+
+def test_subscribe_rejects_a_plain_channel():
+    _fresh_subs()
+    try:
+        _capture(s.cmd_subscribe, _args("subscribe", CHAN), client=FakeClient())
+        assert False, "a channel is not a thread"
+    except SystemExit as e:
+        assert e.code == 2
+
+
+def test_watch_reports_new_replies_and_advances_seen_mark():
+    _fresh_subs()
+    s._save_subs({f"{CHAN}:1700000100.000000": {
+        "channel": CHAN, "thread_ts": "1700000100.000000", "url": SUB_URL,
+        "label": "A", "last_ts": "1700000150.000000"}})
+    fake = FakeClient({"auth_test": {"user_id": ME}, "conversations_replies": _thread(
+        {"ts": "1700000150.000000", "user": "U2", "text": "old"},
+        {"ts": "1700000200.000000", "user": "U3", "text": "fresh reply"})})
+    out = _capture(s.cmd_watch, _args("watch", "--timeout", "0"), client=fake)
+    assert "fresh reply" in out and "old" not in out and "A" in out
+    assert next(iter(s._load_subs().values()))["last_ts"] == "1700000200.000000"
+
+
+def test_watch_ignores_own_messages_by_default():
+    _fresh_subs()
+    s._save_subs({f"{CHAN}:1700000100.000000": {
+        "channel": CHAN, "thread_ts": "1700000100.000000", "url": SUB_URL,
+        "label": "A", "last_ts": "1700000150.000000"}})
+    fake = FakeClient({"auth_test": {"user_id": ME}, "conversations_replies": _thread(
+        {"ts": "1700000200.000000", "user": ME, "text": "my own call"})})
+    try:
+        _capture(s.cmd_watch, _args("watch", "--timeout", "0"), client=fake)
+        assert False, "own message must not count as a notification"
+    except SystemExit as e:
+        assert e.code == 3
+    # own message still advances the seen mark (it was seen)
+    assert next(iter(s._load_subs().values()))["last_ts"] == "1700000200.000000"
+
+
+def test_watch_without_subscriptions_is_a_usage_error():
+    _fresh_subs()
+    try:
+        _capture(s.cmd_watch, _args("watch", "--timeout", "0"), client=FakeClient())
+        assert False
+    except SystemExit as e:
+        assert e.code == 2
+
+
+def test_unsubscribe_and_list():
+    _fresh_subs()
+    s._save_subs({f"{CHAN}:1700000100.000000": {"channel": CHAN, "thread_ts": "1700000100.000000",
+                  "url": SUB_URL, "label": "A", "last_ts": "1"},
+                  f"{CHAN}:1700000500.000000": {"channel": CHAN, "thread_ts": "1700000500.000000",
+                  "url": SUB_URL2, "label": "B", "last_ts": "1"}})
+    out = _capture(s.cmd_subscriptions, _args("subscriptions"), client=FakeClient())
+    assert "A" in out and "B" in out
+    _capture(s.cmd_unsubscribe, _args("unsubscribe", SUB_URL), client=FakeClient())
+    assert [v["label"] for v in s._load_subs().values()] == ["B"]
+
+
 def test_all_new_commands_registered():
     p = s.build_parser()
     assert p.parse_args(["forward", "URL", "#d"]).func is s.cmd_forward
@@ -143,6 +235,10 @@ def test_all_new_commands_registered():
     assert p.parse_args(["scheduled"]).func is s.cmd_scheduled
     assert p.parse_args(["stats", CHAN]).func is s.cmd_stats
     assert p.parse_args(["contacts"]).func is s.cmd_contacts
+    assert p.parse_args(["subscribe", "URL"]).func is s.cmd_subscribe
+    assert p.parse_args(["subscriptions"]).func is s.cmd_subscriptions
+    assert p.parse_args(["unsubscribe", "URL"]).func is s.cmd_unsubscribe
+    assert p.parse_args(["watch"]).func is s.cmd_watch
     assert p.parse_args(["invite", CHAN, "@bob"]).func is s.cmd_invite
     assert p.parse_args(["wait", CHAN]).func is s.cmd_wait
     assert p.parse_args(["listen", CHAN]).func is s.cmd_listen

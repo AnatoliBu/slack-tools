@@ -134,6 +134,25 @@ slack listen <target> [--interval 5] [--after-ts TS] [--limit N]
   `slack wait <thread URL> --after-ts <call ts> --from U0B2YLD53QU --while-contains ":processing:" --timeout 1800 --interval 30`.
   On timeout stderr says whether nothing arrived or the message is still in progress.
 
+## Thread subscriptions (notifications for agents)
+
+```bash
+slack subscribe     <thread URL> [--label PLAT-4731]   # latest reply = seen
+slack subscriptions                                     # label, url, seen mark
+slack unsubscribe   <URL|label> [...]
+slack watch [URL|label ...] [--timeout 6900] [--interval 60] [--follow] [--include-self] [--json]
+```
+
+- `watch` polls every subscribed thread (`conversations.replies`) and **exits 0 on the first new
+  replies**, printing them under `=== <label>  <url>`. The exit is the notification: an agent runs
+  `slack watch` as a background command and is woken when it ends, then runs it again.
+- Every reply read advances the thread's seen mark (stored in `~/.cache/slack-cli/subscriptions.json`),
+  so subscriptions survive sessions and the next `watch` continues where the last one stopped.
+- Own messages advance the mark but do not notify (`--include-self` to change). `--follow` keeps
+  printing instead of exiting. Exit 2 — nothing subscribed / unknown target; exit 3 — timeout.
+- ⚠ Edits of an existing message are **not** seen (no new `ts`). For a bot that finishes by
+  editing its message in place, use `slack wait <URL> --from <id> --while-contains <marker>`.
+
 ## People and channels
 
 ```bash
