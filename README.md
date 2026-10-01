@@ -85,7 +85,11 @@ slack pin <URL> / slack unpin <URL>              # pins.add / pins.remove
 slack join #general / slack leave #general
 slack stats #general --top 5                     # top senders, per-day, files/reactions
 slack wait #general --timeout 120                # block for a new message (exit 3 = timeout)
+slack wait <thread URL> --from U0B2YLD53QU --while-contains ":processing:" --timeout 1800
+                                                 # in a thread; one author; until the bot's message is finished
 slack listen #general                            # NDJSON stream of new msgs (polling; no RTM)
+slack contacts --without-dm --filter ivan        # everyone + dm=<D-id>/no-dm; --with-dm, --bots
+slack invite #general @bob U0B2YLD53QU           # add people or bots to a channel
 slack table #general @rows.tsv --align l,c,r    # Block Kit table from TSV (input validated locally)
 slack md #general @report.md                    # markdown; ```mermaid``` fences → PNG
 slack md #general @report.md --mrkdwn           # source written in mrkdwn: *x* → **x**
@@ -93,8 +97,10 @@ slack channels --filter eng                     # discovery
 slack me                                         # whoami
 ```
 
-> `wait`/`listen` poll `conversations.history` — browser (`xoxc`) tokens can't use
-> RTM/Socket Mode, so there's no true streaming.
+> `wait`/`listen` poll `conversations.history` (`wait <message URL>` — `conversations.replies`
+> of that thread) — browser (`xoxc`) tokens can't use RTM/Socket Mode, so there's no true streaming.
+> `--while-contains` exists because bots such as Dr. House edit one message in place
+> (`:processing:` → result): "a new message appeared" is not "the bot has finished".
 
 Run any subcommand with `-h` for full flags. Full reference → [docs/commands.md](docs/commands.md).
 
@@ -152,7 +158,7 @@ On `401`/expiry the CLI tries, in order:
 python test_win_path.py       # path normalization (10)
 python test_read_render.py    # table render, --json placement, multi-file upload (8)
 python test_read_blocks.py    # rich_text/table render, blocks-over-fallback, one-JSON-doc (29)
-python test_commands.py       # forward/members/pin/join/schedule/stats/wait/listen (21)
+python test_commands.py       # forward/members/pin/join/schedule/stats/wait (thread, --from, --while-contains)/listen/contacts/invite (34)
 python test_input_validation.py  # table/blocks/md input rules, mrkdwn-vs-Markdown (41)
 python test_find_chromium.py  # chromium discovery for mermaid rendering (14)
 ```

@@ -65,6 +65,15 @@ def test_rt_to_str_link_and_list():
 
 # --- TASK-001: `--json` accepted after the subcommand ----------------------
 
+def test_rt_to_str_message_mention_renders_its_url():
+    # Slack turns a pasted message URL into `message_mention`; read printed nothing for it
+    # (2026-10-01: "в треде  набери" — the thread link vanished from the rendered DM).
+    el = {"type": "message_mention", "message_ts": "1790676751.354449",
+          "channel_id": "C09NKNZM97E",
+          "url": "https://loyaltyplant.slack.com/archives/C09NKNZM97E/p1790676751354449"}
+    assert s._rt_to_str(el) == el["url"]
+
+
 def test_json_flag_after_subcommand():
     p = s.build_parser()
     # was the bug: `read <url> --json` → "unrecognized arguments: --json" (rc=2)

@@ -118,6 +118,7 @@ slack stats   <target> [--limit 500] [--top 10]
 
 ```bash
 slack wait   <target> [--timeout 60] [--interval 3] [--after-ts TS] [--limit N]
+             [--from U…|B…] [--while-contains MARKER]
 slack listen <target> [--interval 5] [--after-ts TS] [--limit N]
 ```
 
@@ -125,6 +126,26 @@ slack listen <target> [--interval 5] [--after-ts TS] [--limit N]
   `conversations.history`, they do not stream.
 - `wait` blocks until a new message appears (prints it, exit 0) or `--timeout` elapses
   (**exit 3**). `--after-ts` sets the baseline; default is the channel's current latest.
+- `wait <message URL>` waits **in that thread** (`conversations.replies`); the default baseline
+  is the thread's latest reply. `--from` keeps one author (user `U…` or bot `B…` id).
+- `--while-contains MARKER` keeps waiting while the newest matching message still contains
+  MARKER (text **or** blocks). For bots that edit one message in place — Dr. House shows
+  `:processing:` until the result (case 2026-10-01):
+  `slack wait <thread URL> --after-ts <call ts> --from U0B2YLD53QU --while-contains ":processing:" --timeout 1800 --interval 30`.
+  On timeout stderr says whether nothing arrived or the message is still in progress.
+
+## People and channels
+
+```bash
+slack contacts [--with-dm | --without-dm] [--bots] [--filter S] [--refresh] [--json]
+slack invite   <channel> <@name|name|U…-id> [...]
+```
+
+- `contacts` — every workspace member with `dm=<D-id>` if a 1:1 DM exists, else `no-dm`
+  (`conversations.list types=im` × the users cache). Bots and deleted users are hidden;
+  `--bots` shows bots. `--refresh` re-reads `users.list` (needed once so the cache learns `is_bot`).
+- `invite` — `conversations.invite`: adds people **or bots** (Dr. House is `U0B2YLD53QU`) to a
+  channel. Audited like other writes.
 - `listen` polls forever and prints each new message as one NDJSON line
   (`{ts, channel, user, user_name, text}`); Ctrl-C to stop.
 

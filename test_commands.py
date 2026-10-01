@@ -83,6 +83,55 @@ _TEAM = {"team": {"domain": "testws"}}
 
 # --- argparse registration --------------------------------------------------
 
+# --- contacts / invite (owner request 2026-10-01) ----------------------------
+# "a quick list of all contacts — with whom there is and is not a conversation" and
+# "add someone (e.g. Dr. House) to a channel".
+
+_USERS = {"members": [
+    {"id": "U0000000A1", "name": "alice", "profile": {"real_name": "Alice A"}},
+    {"id": "U0000000B2", "name": "bob", "profile": {"real_name": "Bob B"}},
+    {"id": "U0B2YLD53QU", "name": "dr_house", "is_bot": True, "profile": {"real_name": "Dr. House"}},
+    {"id": "U0000000C3", "name": "gone", "deleted": True, "profile": {}},
+], "response_metadata": {}}
+_IMS = {"channels": [{"id": "D0000000A1", "is_im": True, "user": "U0000000A1"}],
+        "response_metadata": {}}
+
+
+def _fresh_user_cache():
+    if s.USER_CACHE.exists():
+        s.USER_CACHE.unlink()
+
+
+def test_contacts_marks_who_has_a_dm():
+    _fresh_user_cache()
+    fake = FakeClient({"users_list": _USERS, "conversations_list": _IMS})
+    out = _capture(s.cmd_contacts, _args("contacts", "--refresh", "--json"), client=fake)
+    rows = {r["id"]: r for r in json.loads(out)}
+    assert rows["U0000000A1"]["dm"] == "D0000000A1"
+    assert rows["U0000000B2"]["dm"] is None
+    assert "U0B2YLD53QU" not in rows, "bots hidden by default"
+    assert "U0000000C3" not in rows, "deleted users hidden"
+    assert fake.last("conversations_list")["types"] == "im"
+
+
+def test_contacts_without_dm_and_bots_flags():
+    _fresh_user_cache()
+    fake = FakeClient({"users_list": _USERS, "conversations_list": _IMS})
+    out = _capture(s.cmd_contacts, _args("contacts", "--refresh", "--without-dm", "--bots", "--json"),
+                   client=fake)
+    ids = {r["id"] for r in json.loads(out)}
+    assert ids == {"U0000000B2", "U0B2YLD53QU"}
+
+
+def test_invite_resolves_names_and_bot_ids():
+    _fresh_user_cache()
+    fake = FakeClient({"users_list": _USERS, "conversations_invite": {"ok": True}})
+    _capture(s.cmd_invite, _args("invite", CHAN, "@bob", "U0B2YLD53QU"), client=fake)
+    call = fake.last("conversations_invite")
+    assert call["channel"] == CHAN
+    assert call["users"] == "U0000000B2,U0B2YLD53QU"
+
+
 def test_all_new_commands_registered():
     p = s.build_parser()
     assert p.parse_args(["forward", "URL", "#d"]).func is s.cmd_forward
@@ -93,6 +142,8 @@ def test_all_new_commands_registered():
     assert p.parse_args(["leave", CHAN]).func is s.cmd_leave
     assert p.parse_args(["scheduled"]).func is s.cmd_scheduled
     assert p.parse_args(["stats", CHAN]).func is s.cmd_stats
+    assert p.parse_args(["contacts"]).func is s.cmd_contacts
+    assert p.parse_args(["invite", CHAN, "@bob"]).func is s.cmd_invite
     assert p.parse_args(["wait", CHAN]).func is s.cmd_wait
     assert p.parse_args(["listen", CHAN]).func is s.cmd_listen
 
@@ -299,6 +350,63 @@ def test_wait_times_out_with_exit_3():
     try:
         _capture(s.cmd_wait, args, client=fake)
         assert False, "expected SystemExit(3) on timeout"
+    except SystemExit as e:
+        assert e.code == 3
+
+
+# --- wait in a thread: replies, --from, --while-contains --------------------
+# Case 2026-10-01: Dr. House answers in a thread and EDITS its one message in place
+# (`:processing:` -> final). `wait` polled only conversations.history (top level) and
+# fired on any new message, so "the bot has finished" was not expressible.
+
+THREAD_URL = f"https://{WS}/archives/{CHAN}/p1700000100000000"
+
+
+def test_wait_thread_url_polls_replies_not_history():
+    reply = {"ts": "1700000200.000000", "user": "U9", "text": "done"}
+    fake = FakeClient({"conversations_replies": {"messages": [reply]}})
+    args = _args("wait", THREAD_URL, "--after-ts", "1700000150.000000", "--timeout", "5")
+    out = _capture(s.cmd_wait, args, client=fake)
+    assert "done" in out
+    assert fake.count("conversations_history") == 0
+    assert fake.last("conversations_replies")["ts"] == "1700000100.000000"
+
+
+def test_wait_from_ignores_other_authors():
+    other = {"ts": "1700000200.000000", "user": "U1", "text": "noise"}
+    fake = FakeClient({"conversations_replies": {"messages": [other]}})
+    args = _args("wait", THREAD_URL, "--after-ts", "1700000150.000000",
+                 "--from", "U9", "--timeout", "0")
+    try:
+        _capture(s.cmd_wait, args, client=fake)
+        assert False, "expected SystemExit(3): only another author replied"
+    except SystemExit as e:
+        assert e.code == 3
+
+
+def test_wait_while_contains_waits_until_marker_leaves_edited_message():
+    states = iter([":processing: analysing", ":processing: still", "result ready"])
+
+    def replies(**_):
+        return {"messages": [{"ts": "1700000200.000000", "user": "U9", "text": next(states)}]}
+
+    fake = FakeClient({"conversations_replies": replies})
+    args = _args("wait", THREAD_URL, "--after-ts", "1700000150.000000", "--from", "U9",
+                 "--while-contains", ":processing:", "--interval", "0", "--timeout", "30")
+    out = _capture(s.cmd_wait, args, client=fake)
+    assert "result ready" in out
+    assert fake.count("conversations_replies") == 3
+
+
+def test_wait_while_contains_checks_blocks_not_only_text():
+    msg = {"ts": "1700000200.000000", "user": "U9", "text": "",
+           "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": ":processing: x"}}]}
+    fake = FakeClient({"conversations_replies": {"messages": [msg]}})
+    args = _args("wait", THREAD_URL, "--after-ts", "1700000150.000000", "--from", "U9",
+                 "--while-contains", ":processing:", "--interval", "0", "--timeout", "0")
+    try:
+        _capture(s.cmd_wait, args, client=fake)
+        assert False, "marker is in blocks: must keep waiting and time out"
     except SystemExit as e:
         assert e.code == 3
 

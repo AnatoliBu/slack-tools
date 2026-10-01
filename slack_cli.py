@@ -901,6 +901,8 @@ def _rt_to_str(el, styles: bool = True) -> str:
         url, label = el.get("url", ""), el.get("text") or ""
         out = f"<{url}|{label}>" if url and label and label != url else (url or label)
         return _apply_rt_style(out, el.get("style")) if styles else out
+    if t == "message_mention":  # Slack's form of a pasted message URL
+        return el.get("url", "")
     if t == "emoji":
         return f":{el.get('name', '')}:"
     if t == "user":
@@ -1215,11 +1217,10 @@ def cmd_channels(args):
         print(f"{cid}\t{vis}\t#{name}")
 
 
-def cmd_users(args):
-    """List users; --filter substring на name/display/real."""
-    client = _make_client()
+def _users_directory(client: WebClient, refresh: bool = False) -> dict:
+    """users cache {id: {name, display_name, real_name, deleted, is_bot}}; full users.list on refresh/empty."""
     cache = _load_cache(USER_CACHE)
-    if args.refresh or not cache:
+    if refresh or not cache:
         cursor = None
         while True:
             resp = _call("users_list", _client=client, limit=200, cursor=cursor)
@@ -1230,11 +1231,76 @@ def cmd_users(args):
                     "display_name": profile.get("display_name"),
                     "real_name": profile.get("real_name"),
                     "deleted": u.get("deleted", False),
+                    "is_bot": u.get("is_bot", False) or u.get("id") == "USLACKBOT",
                 }
             cursor = resp.get("response_metadata", {}).get("next_cursor")
             if not cursor:
                 break
         _save_cache(USER_CACHE, cache)
+    return cache
+
+
+def _dm_partners(client: WebClient) -> dict[str, str]:
+    """{user_id: D-channel id} for every existing 1:1 DM (conversations.list types=im)."""
+    out: dict[str, str] = {}
+    cursor = None
+    while True:
+        resp = _call("conversations_list", _client=client, types="im", limit=200, cursor=cursor)
+        for ch in resp.get("channels", []) or []:
+            if ch.get("user"):
+                out[ch["user"]] = ch["id"]
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+    return out
+
+
+def cmd_contacts(args, client=None):
+    """Everyone in the workspace + whether a DM with them exists (`dm` = D-id or None).
+
+    People only by default (bots and deleted users hidden; --bots shows bots).
+    --with-dm / --without-dm narrow the list; --filter matches name/display/real name.
+    """
+    client = client or _make_client()
+    users = _users_directory(client, args.refresh)
+    dms = _dm_partners(client)
+    rows = []
+    for uid, info in users.items():
+        if info.get("deleted") or (info.get("is_bot") and not args.bots):
+            continue
+        dm = dms.get(uid)
+        if (args.with_dm and not dm) or (args.without_dm and dm):
+            continue
+        name, display, real = (info.get(k) or "" for k in ("name", "display_name", "real_name"))
+        if args.filter and args.filter.lower() not in (name + display + real).lower():
+            continue
+        rows.append({"id": uid, "name": name, "shown": display or real or name,
+                     "bot": bool(info.get("is_bot")), "dm": dm})
+    rows.sort(key=lambda r: r["name"])
+    if args.json:
+        emit_json(rows)
+        return
+    for r in rows:
+        print(f"{r['id']}\t@{r['name']}\t{r['shown']}\t{'dm=' + r['dm'] if r['dm'] else 'no-dm'}"
+              f"{chr(9) + 'bot' if r['bot'] else ''}")
+    print(f"[summary] {len(rows)} contacts, with dm: {sum(1 for r in rows if r['dm'])}",
+          file=sys.stderr)
+
+
+def cmd_invite(args, client=None):
+    """Add users or bots (e.g. Dr. House) to a channel — conversations.invite."""
+    client = client or _make_client()
+    channel_id = resolve_target(args.channel, client)
+    ids = [_resolve_user_id(u.lstrip("@"), client) for u in args.users]
+    _call("conversations_invite", _client=client, channel=channel_id, users=",".join(ids))
+    audit("invite", channel=channel_id, users=ids)
+    emit({"ok": True, "channel": channel_id, "invited": ",".join(ids)}, args.json)
+
+
+def cmd_users(args):
+    """List users; --filter substring на name/display/real."""
+    client = _make_client()
+    cache = _users_directory(client, args.refresh)
     rows = []
     for uid, info in cache.items():
         if info.get("deleted"):
@@ -1700,7 +1766,9 @@ def _print_new_messages(msgs: list[dict], channel_id: str, client: WebClient,
         ts = m.get("ts", "?")
         tstr = (time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
                 if "." in ts else ts)
-        text = (m.get("text") or "").replace("\n", " ")
+        # bots put the body in blocks and leave `text` as a fallback (or empty)
+        body = m.get("text") or "\n".join(r for _, r in _render_blocks(m.get("blocks")))
+        text = body.replace("\n", " ")
         print(f"--- @{user}  {tstr}  ts={ts}")
         if text:
             print(f"  {text}")
@@ -1713,30 +1781,65 @@ def _baseline_ts(channel_id: str, client: WebClient) -> str:
     return msgs[0].get("ts", "0") if msgs else "0"
 
 
+def _thread_latest_ts(channel_id: str, thread_ts: str, client: WebClient) -> str:
+    """Latest ts in a thread — the poll baseline for `wait <thread URL>`."""
+    resp = _call("conversations_replies", _client=client, channel=channel_id,
+                 ts=thread_ts, limit=200)
+    return max((m.get("ts", "0") for m in resp.get("messages", []) or []), default=thread_ts)
+
+
+def _wait_author_ok(m: dict, who: str | None) -> bool:
+    return not who or who in (m.get("user"), m.get("bot_id"))
+
+
+def _wait_still_busy(m: dict, marker: str | None) -> bool:
+    """True while the message still carries the in-progress marker, in text OR blocks.
+
+    Bots such as Dr. House edit ONE message in place (`:processing:` -> final), and the
+    marker often lives only in blocks (text is a fallback), so the whole message is searched.
+    """
+    return bool(marker) and marker in json.dumps(m, ensure_ascii=False)
+
+
 def cmd_wait(args, client=None):
-    """Poll conversations.history until a new message appears or timeout.
+    """Poll until a new message appears — or, with --while-contains, until it is finished.
+
+    Target: channel / DM → conversations.history; a message URL → conversations.replies of
+    that thread. `--from` keeps one author (user U… or bot B… id). `--while-contains MARKER`
+    keeps waiting while the newest matching message still contains MARKER (bots that edit
+    one message in place). Case 2026-10-01: waiting for Dr. House in a thread was not
+    expressible — wait read only the top level and fired on any new message.
 
     ⚠ RTM/Socket Mode are unavailable with browser (xoxc) tokens — polling only.
-    Exit 0 + prints the new message(s); exit 3 on timeout (no new message).
+    Exit 0 + prints the message(s); exit 3 on timeout.
     """
     client = client or _make_client()
-    channel_id = resolve_target(args.target, client)
-    after_ts = args.after_ts or _baseline_ts(channel_id, client)
+    channel_id, thread_ts = resolve_target_and_thread(args.target, None, client)
+    after_ts = args.after_ts or (_thread_latest_ts(channel_id, thread_ts, client) if thread_ts
+                                 else _baseline_ts(channel_id, client))
+    who, marker = args.from_user, args.while_contains
     deadline = time.time() + args.timeout
+    new: list[dict] = []
     while True:
-        resp = _call("conversations_history", _client=client, channel=channel_id,
-                     oldest=after_ts, limit=args.limit)
+        if thread_ts:
+            resp = _call("conversations_replies", _client=client, channel=channel_id,
+                         ts=thread_ts, oldest=after_ts, limit=args.limit)
+        else:
+            resp = _call("conversations_history", _client=client, channel=channel_id,
+                         oldest=after_ts, limit=args.limit)
         new = sorted((m for m in resp.get("messages", []) or []
-                      if m.get("ts", "0") > after_ts),
+                      if m.get("ts", "0") > after_ts and _wait_author_ok(m, who)),
                      key=lambda m: m.get("ts", "0"))
-        if new:
+        if new and not _wait_still_busy(new[-1], marker):
             _print_new_messages(new, channel_id, client, args.json)
             return
         if time.time() >= deadline:
             break
         time.sleep(min(args.interval, max(0.0, deadline - time.time())))
-    print(f"[timeout] no new messages in {channel_id} after ts={after_ts} "
-          f"within {args.timeout}s", file=sys.stderr)
+    state = f"newest message still contains {marker!r}" if new else "no new messages"
+    where = f"{channel_id} thread {thread_ts}" if thread_ts else channel_id
+    print(f"[timeout] {state} in {where} after ts={after_ts} within {args.timeout}s",
+          file=sys.stderr)
     sys.exit(3)
 
 
@@ -2059,6 +2162,20 @@ def build_parser():
     s.add_argument("--refresh", action="store_true")
     s.set_defaults(func=cmd_users)
 
+    s = addp("contacts", help="everyone + whether a DM exists (dm=D-id / no-dm); bots hidden")
+    s.add_argument("--filter", help="substring in name/display/real")
+    dm_grp = s.add_mutually_exclusive_group()
+    dm_grp.add_argument("--with-dm", action="store_true", help="only people you have a DM with")
+    dm_grp.add_argument("--without-dm", action="store_true", help="only people without a DM")
+    s.add_argument("--bots", action="store_true", help="include bots (e.g. Dr. House)")
+    s.add_argument("--refresh", action="store_true", help="re-read users.list into the cache")
+    s.set_defaults(func=cmd_contacts)
+
+    s = addp("invite", help="add users/bots to a channel (conversations.invite)")
+    s.add_argument("channel", help="#channel / C-id / message URL")
+    s.add_argument("users", nargs="+", help="@name, display/real name, or U…-id (bots too)")
+    s.set_defaults(func=cmd_invite)
+
     s = addp("whoami-msg", help="author of a message by URL")
     s.add_argument("url")
     s.set_defaults(func=cmd_whoami_msg)
@@ -2179,8 +2296,13 @@ def build_parser():
     s.add_argument("--top", type=int, default=10, help="how many top senders to show")
     s.set_defaults(func=cmd_stats)
 
-    s = addp("wait", help="poll until a new message appears (exit 3 on timeout)")
-    s.add_argument("target")
+    s = addp("wait", help="poll until a new message appears (exit 3 on timeout); "
+                          "a message URL waits in that thread")
+    s.add_argument("target", help="#channel / @user / C-id, or a message URL = that thread")
+    s.add_argument("--from", dest="from_user", help="only this author (user U… or bot B… id)")
+    s.add_argument("--while-contains", dest="while_contains", metavar="MARKER",
+                   help="keep waiting while the newest matching message contains MARKER "
+                        "(bots that edit one message in place, e.g. ':processing:')")
     s.add_argument("--timeout", type=float, default=60.0, help="seconds before giving up")
     s.add_argument("--interval", type=float, default=3.0, help="poll interval seconds")
     s.add_argument("--after-ts", dest="after_ts",
