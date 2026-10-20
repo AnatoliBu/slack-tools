@@ -76,6 +76,8 @@ slack read <URL> --json                         # raw API JSON (flag works befor
 slack search "query" --in #general --from @user --after 2026-01-01
 slack upload #general a.png b.png --comment "two files, one post"
 slack download <F-id> -o ./out.png
+slack download https://host/x.apk -o ./dir          # чужой хост не пустил (401/403/404) → тот же файл из Slack
+slack search --files --type apk --limit 1 --download ./dir   # самый свежий APK, выложенный файлом
 slack files <URL> --thread --download ./dir
 slack forward <URL> #other --comment "fyi"      # re-share (permalink + unfurl preview)
 slack send #general "standup" --schedule 2026-07-20T09:00   # chat.scheduleMessage

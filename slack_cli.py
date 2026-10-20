@@ -19,7 +19,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -1036,6 +1038,53 @@ def _render_blocks(blocks) -> list[tuple[str, str]]:
     return out
 
 
+def _render_attachments(atts) -> list[str]:
+    """Legacy `attachments` (Jenkins, Bender и другие боты) → текст, по строке на вложение.
+
+    У таких сообщений `text` пуст, а `blocks` нет: тело — в `pretext`/`title`/`text`/`fields`,
+    `fallback` дублирует их для уведомлений. До 2026-10-20 `read` печатал пустое тело, и
+    ссылку на сборку из `#app_builds` приходилось доставать из `--json`.
+    """
+    out = []
+    for a in atts or []:
+        if not isinstance(a, dict):
+            continue
+        parts = []
+        for key in ("pretext", "author_name"):
+            if a.get(key):
+                parts.append(str(a[key]))
+        title = a.get("title")
+        if title:
+            link = a.get("title_link")
+            parts.append(f"<{link}|{title}>" if link else str(title))
+        if a.get("text"):
+            parts.append(str(a["text"]))
+        for field in a.get("fields") or []:
+            if not isinstance(field, dict):
+                continue
+            ft = str(field.get("title") or "").strip()
+            fv = str(field.get("value") or "").strip()
+            if fv:
+                parts.append(f"{ft}: {fv}" if ft else fv)
+            elif ft:
+                parts.append(ft)
+        parts += [r for _, r in _render_blocks(a.get("blocks"))]
+        if a.get("footer"):
+            parts.append(str(a["footer"]))
+        uniq = []
+        for part in parts:
+            part = part.strip("\n")
+            if part and part not in uniq:
+                uniq.append(part)
+        if not uniq and a.get("fallback"):
+            uniq = [str(a["fallback"]).strip("\n")]
+        if a.get("image_url"):
+            uniq.append(f"[image] {a['image_url']}")
+        if uniq:
+            out.append("\n".join(uniq))
+    return out
+
+
 def cmd_read(args):
     client = _make_client()
     _, msgs = _messages_for_target(args.target, client, args.limit, force_thread=args.thread)
@@ -1070,8 +1119,11 @@ def cmd_read(args):
             print(f"  {_indent_text(text)}")
         if body:
             print(f"  {_indent_text(body)}")
+        att = "\n".join(_render_attachments(m.get("attachments")))
+        if att:
+            print(f"  {_indent_text(att)}")
         files = m.get("files", []) or []
-        if not text and not body and not files:
+        if not text and not body and not att and not files:
             print("  ")
         for file_info in files:
             total_files += 1
@@ -1145,11 +1197,132 @@ def _in_filter(in_target: str, client: WebClient) -> str:
     return f"in:#{bare}"
 
 
-def cmd_search(args):
-    """search.messages с фильтрами. Работает только с user-token (xoxc) — нам ок."""
-    client = _make_client()
+def _file_types(spec: Optional[str]) -> list[str]:
+    return [t.strip().lower().lstrip(".") for t in (spec or "").split(",") if t.strip()]
+
+
+def _file_matches_type(f: dict, types: list[str]) -> bool:
+    if not types:
+        return True
+    name = (f.get("name") or "").lower()
+    return (f.get("filetype") or "").lower() in types or any(name.endswith("." + t) for t in types)
+
+
+def _share_context(f: dict, client: WebClient) -> dict:
+    """Где файл выложен: канал, URL сообщения и его текст (подпись вида «для тестов»).
+
+    `search.files` отдаёт только id каналов; сообщение-владельца знает `files.info` → `shares`.
+    Берётся самое позднее размещение.
+    """
+    info = _call("files_info", _client=client, file=f["id"]).get("file") or {}
+    best = None
+    for kind in (info.get("shares") or {}).values():
+        for ch, lst in (kind or {}).items():
+            for sh in lst or []:
+                if best is None or float(sh.get("ts", 0)) > float(best[1].get("ts", 0)):
+                    best = (ch, sh)
+    if not best:
+        return {}
+    ch, sh = best
+    ts, thread_ts = sh.get("ts"), sh.get("thread_ts")
+    text = ""
+    try:
+        if thread_ts and thread_ts != ts:
+            r = _call("conversations_replies", _client=client, channel=ch, ts=thread_ts,
+                      oldest=ts, latest=ts, inclusive=True, limit=2)
+        else:
+            r = _call("conversations_history", _client=client, channel=ch, latest=ts,
+                      inclusive=True, limit=1)
+        for m in r.get("messages") or []:
+            if m.get("ts") == ts:
+                text = (m.get("text") or "").strip()
+    except SlackApiError:
+        pass  # канал без доступа на чтение истории: место размещения всё равно известно
+    return {"channel": ch, "channel_name": sh.get("channel_name") or ch, "msg_ts": ts,
+            "msg_url": _msg_permalink(ch, ts, thread_ts), "msg_text": text}
+
+
+def _download_url(url: str, out: Path, headers: dict) -> None:
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req) as r, out.open("wb") as fh:
+        while True:
+            chunk = r.read(64 * 1024)
+            if not chunk:
+                break
+            fh.write(chunk)
+
+
+def _search_files(client: WebClient, query: str, types: list[str], limit: int) -> list[dict]:
+    """search.files, новые первыми; фильтр типа — на нашей стороне (у search.files его нет)."""
+    found, page = [], 1
+    while len(found) < limit and page <= 10:
+        r = _call("search_files", _client=client, query=query, count=100, page=page,
+                  sort="timestamp", sort_dir="desc")
+        block = r.get("files") or {}
+        for f in block.get("matches") or []:
+            if _file_matches_type(f, types) and all(x["id"] != f["id"] for x in found):
+                found.append(f)
+        if page >= int((block.get("paging") or {}).get("pages") or 1):
+            break
+        page += 1
+    found.sort(key=lambda f: -float(f.get("timestamp") or f.get("created") or 0))
+    return found[:limit]
+
+
+def cmd_search_files(args, client, q):
+    types = _file_types(args.type)
+    if not q.strip():
+        raise ValueError("search --files: нужен query или --type")
+    files = _search_files(client, q, types, args.limit)
+    rows = []
+    for f in files:
+        ctx = {} if args.no_context else _share_context(f, client)
+        rows.append({"id": f.get("id"), "name": f.get("name"), "title": f.get("title"),
+                     "filetype": f.get("filetype"), "size": f.get("size"),
+                     "timestamp": f.get("timestamp") or f.get("created"),
+                     "user": f.get("user"), "permalink": f.get("permalink"),
+                     "url_private_download": f.get("url_private_download"), **ctx})
+    if args.json:
+        emit_json(rows)
+    else:
+        if not rows:
+            print(f"(файлов не найдено: query={q!r}"
+                  + (f", type={','.join(types)}" if types else "") + ")", file=sys.stderr)
+        for r in rows:
+            ts = r.get("timestamp")
+            tstr = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts))) if ts else "?"
+            where = f"#{r['channel_name']}" if r.get("channel_name") else ""
+            print(f"{tstr}  {r['id']}  {r.get('name')}  {_human_size(r.get('size'))}  "
+                  f"{where}  @{_user_name(r.get('user'), client)}")
+            if r.get("msg_text"):
+                text = r["msg_text"].replace("\n", " ")
+                print(f"  {text[:160]}" + ("…" if len(text) > 160 else ""))
+            if r.get("msg_url"):
+                print(f"  {r['msg_url']}")
+    if args.download:
+        out_dir = Path(args.download)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for r in rows:
+            url = r.get("url_private_download")
+            if not url:
+                continue
+            out = out_dir / (r.get("name") or r["id"])
+            _download_url(url, out, _slack_auth_headers())
+            audit("search-files-download", file=r["id"], path=str(out))
+            print(f"→ {out}  {out.stat().st_size} B", file=sys.stderr)
+
+
+def cmd_search(args, client=None):
+    """search.messages с фильтрами. Работает только с user-token (xoxc) — нам ок.
+
+    `--files` переключает на search.files (вложения: APK, логи, скрины), `--type apk,aab`
+    фильтрует по расширению, `--download DIR` скачивает найденное.
+    """
+    client = client or _make_client()
     domain = team_domain(client)
-    q = args.query
+    q = args.query or ""
+    if getattr(args, "files", False) and not q:
+        q = " ".join(_file_types(args.type))
     if args.in_target:
         q += f" {_in_filter(args.in_target, client)}"
     if args.from_user:
@@ -1160,6 +1333,10 @@ def cmd_search(args):
     if args.before:
         q += f" before:{args.before}"
 
+    if getattr(args, "files", False):
+        return cmd_search_files(args, client, q)
+    if not args.query:
+        raise ValueError("search: нужен query")
     resp = _call("search_messages", _client=client, query=q, count=args.limit, sort="timestamp")
     matches = resp.get("messages", {}).get("matches", [])
 
@@ -1172,7 +1349,8 @@ def cmd_search(args):
         user = m.get("username") or _user_name(m.get("user"), client)
         ts = m.get("ts", "?")
         tstr = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts))) if "." in ts else ts
-        text = (m.get("text") or "").replace("\n", " ")
+        text = (m.get("text") or "").strip() or " ".join(_render_attachments(m.get("attachments")))
+        text = text.replace("\n", " ")
         snippet = text[:120] + ("…" if len(text) > 120 else "")
         permalink = m.get("permalink") or make_url(domain, ch.get("id", ""), ts)
         print(f"{tstr}  #{ch_name}  @{user}")
@@ -1391,10 +1569,73 @@ def cmd_files(args):
             print(f"   {s}", file=sys.stderr)
 
 
-def cmd_download(args):
-    """Download a file by ID or permalink."""
-    import urllib.request
-    client = _make_client()
+def _is_slack_host(url: str) -> bool:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host == "slack.com" or host.endswith(".slack.com") or host.endswith(".slack-edge.com")
+
+
+_COPY_SUFFIX_RE = re.compile(r"\s*\(\d+\)$")
+
+
+def _file_stem(name: str) -> str:
+    """`3373_11301400 (1).apk` → `3373_11301400`: копия, выложенная повторно, — тот же файл."""
+    stem = name.rsplit("/", 1)[-1].split("?")[0]
+    stem = urllib.parse.unquote(stem)
+    if "." in stem:
+        stem = stem.rsplit(".", 1)[0]
+    return _COPY_SUFFIX_RE.sub("", stem).strip().lower()
+
+
+def _slack_copy_of(url: str, client: WebClient) -> Optional[dict]:
+    """Тот же файл (имя без « (N)» и расширение совпадают), выложенный в Slack, — самый свежий."""
+    name = urllib.parse.unquote(url.rsplit("/", 1)[-1].split("?")[0])
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    stem = _file_stem(name)
+    if not stem:
+        return None
+    for f in _search_files(client, stem, [ext] if ext else [], 20):
+        if _file_stem(f.get("name") or "") == stem:
+            return f
+    return None
+
+
+def cmd_download(args, client=None):
+    """Download a file by ID or URL.
+
+    Slack-файл (F-id или url_private) — через пару xoxc + cookie `d`. Чужой URL — без них
+    (до 2026-10-20 Slack-cookie уходил на любой хост). Не пустил чужой хост (401/403/404) —
+    ищем тот же файл, выложенный в Slack (`#app_builds` даёт ссылки на jenkins_cloud под
+    basic-auth, а те же APK люди кладут в треды файлом), и качаем его.
+    """
+    client = client or _make_client()
+    if args.file.startswith("http") and not _is_slack_host(args.file):
+        name = urllib.parse.unquote(args.file.rsplit("/", 1)[-1].split("?")[0]) or "downloaded"
+        out = Path(args.output) if args.output else Path.cwd() / name
+        if out.is_dir():
+            out = out / name
+        try:
+            _download_url(args.file, out, {})
+            audit("download", file=args.file, path=str(out))
+            emit({"path": str(out), "size": out.stat().st_size, "source": args.file}, args.json)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code not in (401, 403, 404):
+                raise
+            print(f"→ {urllib.parse.urlsplit(args.file).hostname}: HTTP {e.code}; "
+                  f"ищу {name} файлом в Slack", file=sys.stderr)
+        f = _slack_copy_of(args.file, client)
+        if not f:
+            raise RuntimeError(f"{args.file}: хост не пустил, и в Slack файла "
+                               f"«{_file_stem(name)}» нет")
+        if not args.output:
+            out = Path.cwd() / name
+        _download_url(f["url_private_download"], out, _slack_auth_headers())
+        audit("download", file=args.file, slack_file=f["id"], path=str(out))
+        ctx = _share_context(f, client)
+        emit({"path": str(out), "size": out.stat().st_size, "source": "slack",
+              "slack_file": f["id"], "slack_name": f.get("name"),
+              "msg_url": ctx.get("msg_url", ""), "msg_text": ctx.get("msg_text", "")}, args.json)
+        return
     if args.file.startswith("F") and len(args.file) >= 9:
         # file ID → files.info → url_private_download
         resp = _call("files_info", _client=client, file=args.file)
@@ -2256,8 +2497,15 @@ def build_parser():
     s = addp("me", help="show my user info")
     s.set_defaults(func=cmd_me)
 
-    s = addp("search", help="search messages")
-    s.add_argument("query")
+    s = addp("search", help="search messages (--files: файлы)")
+    s.add_argument("query", nargs="?", default="")
+    s.add_argument("--files", action="store_true",
+                   help="искать файлы (search.files), а не сообщения; новые первыми")
+    s.add_argument("--type", help="с --files: расширения через запятую (apk,aab); без query ищет по ним")
+    s.add_argument("--download", type=win_path, metavar="DIR",
+                   help="с --files: скачать найденное в DIR (сузь --limit 1 для самого свежего)")
+    s.add_argument("--no-context", action="store_true",
+                   help="с --files: не читать сообщение-владельца (быстрее, без подписи и URL)")
     s.add_argument("--in", dest="in_target", help="#channel / @user / C-id")
     s.add_argument("--from", dest="from_user", help="@user")
     s.add_argument("--after", help="YYYY-MM-DD or relative")
@@ -2305,8 +2553,8 @@ def build_parser():
                    help="скачать все найденные файлы (hosted) в каталог DIR (имя = <Fid>_<name>)")
     s.set_defaults(func=cmd_files)
 
-    s = addp("download", help="download file by F-id or URL")
-    s.add_argument("file", help="F-id or url_private_download")
+    s = addp("download", help="download file by F-id or URL (чужой хост не пустил → тот же файл из Slack)")
+    s.add_argument("file", help="F-id, url_private_download или чужой URL (jenkins_cloud и т.п.)")
     s.add_argument("-o", "--output", type=win_path, help="output path (file or dir)")
     s.set_defaults(func=cmd_download)
 
