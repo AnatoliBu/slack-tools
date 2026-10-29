@@ -694,6 +694,8 @@ def _view_state(view: dict, forms: dict[str, str]) -> dict:
             for group in element.get("option_groups") or []:
                 options.extend(group.get("options") or [])
             option = next((o for o in options if str(o.get("value")) == raw), None)
+            if option is None and etype == "external_select":
+                option = {"text": {"type": "plain_text", "text": raw}, "value": raw}
             if not option:
                 raise InteractionError("invalid_form_value", f"{raw!r} is not an option for block {block_id!r}")
             value = {"type": etype, "selected_option": option}
@@ -703,6 +705,12 @@ def _view_state(view: dict, forms: dict[str, str]) -> dict:
             for group in element.get("option_groups") or []:
                 options.extend(group.get("options") or [])
             selected = [o for o in options if str(o.get("value")) in requested]
+            if etype == "multi_external_select":
+                selected_values = {str(option.get("value")) for option in selected}
+                selected.extend(
+                    {"text": {"type": "plain_text", "text": item}, "value": item}
+                    for item in requested if item not in selected_values
+                )
             if len(selected) != len(requested):
                 raise InteractionError("invalid_form_value", f"unknown option in {raw!r} for block {block_id!r}")
             value = {"type": etype, "selected_options": selected}
@@ -769,12 +777,20 @@ def cmd_click(args, client=None):
             options.extend(group.get("options") or [])
         if etype in ("static_select", "external_select", "overflow", "radio_buttons"):
             option = next((o for o in options if str(o.get("value")) == raw_value), None)
+            if option is None and etype == "external_select":
+                option = {"text": {"type": "plain_text", "text": raw_value}, "value": raw_value}
             if not option:
                 raise InteractionError("invalid_action_value", f"{raw_value!r} is not an option for action {args.action!r}")
             action["selected_option"] = option
         elif etype in ("multi_static_select", "multi_external_select", "checkboxes"):
             wanted = [part.strip() for part in raw_value.split(",") if part.strip()]
             selected = [o for o in options if str(o.get("value")) in wanted]
+            if etype == "multi_external_select":
+                selected_values = {str(option.get("value")) for option in selected}
+                selected.extend(
+                    {"text": {"type": "plain_text", "text": item}, "value": item}
+                    for item in wanted if item not in selected_values
+                )
             if len(selected) != len(wanted):
                 raise InteractionError("invalid_action_value", f"unknown option in {raw_value!r} for action {args.action!r}")
             action["selected_options"] = selected

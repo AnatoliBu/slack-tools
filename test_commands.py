@@ -418,6 +418,79 @@ def test_view_state_requires_mandatory_input_and_rejects_unknown_block():
         assert exc.code == "unknown_form_block"
 
 
+def test_view_state_accepts_dynamic_external_select_choice():
+    view = {"blocks": [{"type": "input", "block_id": "person", "element": {
+        "type": "external_select", "action_id": "value", "options": []}}]}
+    state = s._view_state(view, {"person": "U_DYNAMIC"})
+    assert state["person"]["value"]["selected_option"] == {
+        "text": {"type": "plain_text", "text": "U_DYNAMIC"}, "value": "U_DYNAMIC"}
+
+
+def test_view_state_accepts_dynamic_multi_external_select_choices():
+    view = {"blocks": [{"type": "input", "block_id": "people", "element": {
+        "type": "multi_external_select", "action_id": "value", "options": []}}]}
+    state = s._view_state(view, {"people": "U_DYNAMIC_1,U_DYNAMIC_2"})
+    assert state["people"]["value"]["selected_options"] == [
+        {"text": {"type": "plain_text", "text": "U_DYNAMIC_1"}, "value": "U_DYNAMIC_1"},
+        {"text": {"type": "plain_text", "text": "U_DYNAMIC_2"}, "value": "U_DYNAMIC_2"}]
+
+
+def test_view_state_still_rejects_unknown_static_select_choice():
+    view = {"blocks": [{"type": "input", "block_id": "mode", "element": {
+        "type": "static_select", "action_id": "value", "options": [
+            {"text": {"type": "plain_text", "text": "Known"}, "value": "known"}]}}]}
+    try:
+        s._view_state(view, {"mode": "unknown"})
+        assert False, "unknown static option accepted"
+    except s.InteractionError as exc:
+        assert exc.code == "invalid_form_value"
+
+
+def _assert_click_dry_run_dynamic_external_select(etype, raw, expected_key, expected_values):
+    url = f"https://{WS}/archives/{DEST}/p1700000000000000"
+    old_load_env = s._load_env
+    s._load_env = lambda: {"SLACK_XOXC": "xoxc-test"}
+    try:
+        msg = {"ts": "1700000000.000000", "blocks": [{"type": "actions", "block_id": "b",
+            "elements": [{"type": etype, "action_id": "choose", "options": []}]}]}
+        fake = FakeClient({"conversations_history": {"messages": [msg]}})
+        args = _args("click", url, "--action", "choose", "--value", raw, "--dry-run", "--json")
+        payload = json.loads(_capture(s.cmd_click, args, client=fake))["payload"]
+        action = json.loads(payload["actions"])[0]
+        selected = action[expected_key]
+        selected = [selected] if expected_key == "selected_option" else selected
+        assert [option["value"] for option in selected] == expected_values
+        assert all(option["text"]["type"] == "plain_text" for option in selected)
+        assert fake.count("api_call") == 0
+    finally:
+        s._load_env = old_load_env
+
+
+def test_click_dry_run_accepts_dynamic_external_select_choice():
+    _assert_click_dry_run_dynamic_external_select(
+        "external_select", "U_DYNAMIC", "selected_option", ["U_DYNAMIC"])
+
+
+def test_click_dry_run_accepts_dynamic_multi_external_select_choices():
+    _assert_click_dry_run_dynamic_external_select(
+        "multi_external_select", "U_DYNAMIC_1,U_DYNAMIC_2", "selected_options",
+        ["U_DYNAMIC_1", "U_DYNAMIC_2"])
+
+
+def test_click_dry_run_still_rejects_unknown_static_select_choice():
+    url = f"https://{WS}/archives/{DEST}/p1700000000000000"
+    msg = {"ts": "1700000000.000000", "blocks": [{"type": "actions", "block_id": "b",
+        "elements": [{"type": "static_select", "action_id": "choose", "options": [
+            {"text": {"type": "plain_text", "text": "Known"}, "value": "known"}]}]}]}
+    fake = FakeClient({"conversations_history": {"messages": [msg]}})
+    args = _args("click", url, "--action", "choose", "--value", "unknown", "--dry-run", "--json")
+    try:
+        s.cmd_click(args, client=fake)
+        assert False, "unknown static option accepted"
+    except s.InteractionError as exc:
+        assert exc.code == "invalid_action_value"
+
+
 def test_click_dry_run_is_read_only_and_describes_action():
     url = f"https://{WS}/archives/{DEST}/p1700000000000000"
     msg = {"ts": "1700000000.000000", "blocks": [{"type": "actions", "block_id": "b",

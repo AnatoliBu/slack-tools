@@ -184,8 +184,10 @@ checkboxes and radio buttons), including `block_id`, `action_id`, label/text, va
 options. `click --dry-run` resolves the message and prints the selected action without sending it.
 Use `--value` for a selection/date/time action. A click that opens a modal returns its common view
 description and input schema without submitting it. Repeat `--form BLOCK_ID=VALUE` to fill modal
-inputs by `block_id` and submit; option values must match the modal's declared options. The submitted
-state follows Slack's `view.state.values` shape: `block_id -> action_id -> {type, value or selected_*}`.
+inputs by `block_id` and submit; static option values must match the modal's declared options. For
+`external_select` and `multi_external_select`, `--value` may name dynamically loaded choices that
+are absent from the view's embedded options. The submitted state follows Slack's
+`view.state.values` shape: `block_id -> action_id -> {type, value or selected_*}`.
 
 `--json` returns one JSON document. Interaction failures use `{ok:false,error,message}` and exit 1;
 examples include `action_not_found`, `missing_service_id`, `view_timeout`, `missing_required_form`,
