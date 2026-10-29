@@ -863,6 +863,20 @@ def test_buttons_on_unknown_message_is_not_found_not_another_message():
         raise AssertionError("expected message_not_found")
 
 
+def test_no_split_over_slack_limit_is_refused_not_posted():
+    """Slack сам режет text > ~4000 символов на несколько сообщений: блок ``` ломается,
+    а бот, которого упомянули, получает в app_mention только первую часть."""
+    fake = FakeClient()
+    long_text = "<@U0B2YLD53QU>\n```" + ("строка рецепта\n" * 400) + "```"
+    try:
+        _capture(s.cmd_send, _args("send", CHAN, long_text, "--no-split", "--no-notify"), client=fake)
+    except SystemExit as e:
+        assert "no-split" in str(e) and str(s.MAX_CHARS) in str(e), e
+    else:
+        raise AssertionError("long --no-split text was posted")
+    assert fake.count("chat_postMessage") == 0
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

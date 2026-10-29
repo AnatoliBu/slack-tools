@@ -1131,6 +1131,12 @@ def cmd_send(args, client=None):
     dest = dest_of(channel_id, thread_ts, client)
     domain = team_domain(client)
 
+    if args.no_split and len(text) > MAX_CHARS:
+        # Slack сам режет длинный text на несколько сообщений: ``` ломается, а упомянутый бот
+        # получает в app_mention только первую часть. Не постим молча испорченное.
+        sys.exit(f"ERROR: --no-split text is {len(text)} chars > {MAX_CHARS}: Slack would split it "
+                 "itself (broken ``` blocks, mentioned bots see only part 1). Shorten it, drop "
+                 "--no-split (fence-aware split), or post a file (`slack md` / `upload`).")
     parts = split_text(text) if not args.no_split else [text]
 
     # --schedule <ISO8601>: chat.scheduleMessage instead of chat.postMessage.
