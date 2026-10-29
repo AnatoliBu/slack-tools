@@ -765,6 +765,38 @@ def test_md_with_url_target_posts_into_the_thread():
     assert fake.last("chat_postMessage")["thread_ts"] == _THREAD_TS
 
 
+def test_buttons_on_thread_reply_url_reads_that_reply_not_channel_latest():
+    """URL ответа в треде (?thread_ts=) → именно этот reply, а не последнее сообщение канала."""
+    reply = {"ts": "1793279706.302369", "thread_ts": "1788599118.790599", "bot_id": "B1",
+             "blocks": [{"type": "actions", "block_id": "ctl",
+                         "elements": [{"type": "button", "action_id": "steer",
+                                       "text": {"type": "plain_text", "text": "Go"}, "value": "v"}]}]}
+    fake = FakeClient({
+        "conversations_history": {"messages": [{"ts": "1793273857.202359", "text": "other"}]},
+        "conversations_replies": {"messages": [{"ts": "1788599118.790599"}, reply]},
+    })
+    url = ("https://loyaltyplant.slack.com/archives/C09NKNZM97E/p1793279706302369"
+           "?thread_ts=1788599118.790599&cid=C09NKNZM97E")
+    out = json.loads(_capture(s.cmd_buttons, _args("buttons", url, "--json"), client=fake))
+    assert out["ts"] == "1793279706.302369", out
+    assert [e["action_id"] for e in out["elements"]] == ["steer"], out
+
+
+def test_buttons_on_unknown_message_is_not_found_not_another_message():
+    fake = FakeClient({
+        "conversations_history": {"messages": [{"ts": "1793273857.202359", "text": "other"}]},
+        "conversations_replies": {"messages": [{"ts": "1788599118.790599"}]},
+    })
+    url = ("https://loyaltyplant.slack.com/archives/C09NKNZM97E/p1793279706302369"
+           "?thread_ts=1788599118.790599&cid=C09NKNZM97E")
+    try:
+        _capture(s.cmd_buttons, _args("buttons", url, "--json"), client=fake)
+    except s.InteractionError as e:
+        assert "not_found" in str(e) or getattr(e, "code", "") == "message_not_found", e
+    else:
+        raise AssertionError("expected message_not_found")
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

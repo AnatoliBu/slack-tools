@@ -545,7 +545,14 @@ def _msg_permalink(channel: str, ts: Optional[str], thread_ts: Optional[str] = N
 
 
 def _message_from_url(url: str, client: WebClient) -> tuple[str, Optional[dict]]:
-    channel_id, ts, _ = parse_url(url)
+    channel_id, ts, thread_ts = parse_url(url)
+    if thread_ts and thread_ts != ts:
+        # URL ответа в треде: conversations.history ответов не содержит
+        replies = _call("conversations_replies", _client=client, channel=channel_id,
+                        ts=thread_ts, latest=ts, inclusive=True, limit=200)
+        for reply in replies.get("messages", []):
+            if reply.get("ts") == ts:
+                return channel_id, reply
     resp = _call("conversations_history", _client=client, channel=channel_id,
                  latest=ts, inclusive=True, limit=1)
     msgs = resp.get("messages", [])
@@ -570,7 +577,8 @@ def _message_from_url(url: str, client: WebClient) -> tuple[str, Optional[dict]]
             if reply.get("ts") == ts:
                 return channel_id, reply
 
-    return channel_id, msgs[0] if msgs else None
+    # Не нашли — None, а не соседнее сообщение: иначе buttons/click/read молча берут чужое
+    return channel_id, None
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +886,9 @@ def _messages_for_target(target: str, client: WebClient, limit: int,
 
     if "slack.com/archives/" in target:
         channel_id, msg = _message_from_url(target, client)
+        if not msg:
+            sys.exit(f"ERROR: message not found: {target} — для ответа в треде нужен URL с ?thread_ts= "
+                     "(Copy link в Slack его даёт)")
         # Авто-разворот треда — только если URL указывает на РОДИТЕЛЯ треда
         # (thread_ts == ts) с ответами, либо явно запрошен --thread.
         # URL на конкретный reply (thread_ts != ts) без --thread → само сообщение,
