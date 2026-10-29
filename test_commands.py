@@ -542,6 +542,29 @@ def test_click_builds_blocks_actions_and_view_submit_payloads_offline():
     assert result["submitted"] is True
 
 
+def test_click_uses_bot_id_as_service_id_and_generated_client_token():
+    """Замер 2026-10-29 на сообщении бота: app_id → invalid_service_id, bot_id → ok;
+    client_token — сгенерированный id клиента, а не xoxc-токен."""
+    url = f"https://{WS}/archives/{DEST}/p1700000000000000"
+    msg = {"ts": "1700000000.000000", "app_id": "A000000001", "bot_id": "B000000001", "blocks": [{
+        "type": "actions", "block_id": "c", "elements": [{
+            "type": "button", "action_id": "go", "text": {"type": "plain_text", "text": "Go"}}]}]}
+    fake = FakeClient({"conversations_history": {"messages": [msg]},
+                       "api_call": lambda api_method, **kw: {"ok": True}})
+    load_env = s._load_env
+    s._load_env = lambda: {"SLACK_XOXC": "xoxc-secret"}
+    try:
+        try:
+            _capture(s.cmd_click, _args("click", url, "--action", "go", "--timeout", "0", "--json"), client=fake)
+        except s.InteractionError:
+            pass  # модалки нет — не предмет этого теста
+    finally:
+        s._load_env = load_env
+    params = [kw for m, kw in fake.calls if m == "api_call"][0]["params"]
+    assert params["service_id"] == "B000000001", params
+    assert params["client_token"].startswith("web-") and "xoxc" not in params["client_token"], params
+
+
 # --- send --schedule --------------------------------------------------------
 
 def test_send_schedule_uses_scheduleMessage_with_post_at():

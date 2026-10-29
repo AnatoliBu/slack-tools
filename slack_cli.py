@@ -772,7 +772,8 @@ def cmd_click(args, client=None):
         code = "action_not_found" if not matches else "action_ambiguous"
         raise InteractionError(code, f"expected one matching action_id={args.action!r}; found {len(matches)}")
     element = matches[0]
-    service_id = message.get("app_id") or message.get("bot_id")
+    # Замер 2026-10-29: Slack принимает bot_id (B…); app_id (A…) → invalid_service_id
+    service_id = message.get("bot_id") or message.get("app_id")
     etype = element.get("type")
     if etype not in ("button", "overflow") and not args.value:
         raise InteractionError("selection_required", f"{etype} needs a selected value; pass --value")
@@ -824,7 +825,8 @@ def cmd_click(args, client=None):
         "actions": json.dumps([action], ensure_ascii=False),
         "container": json.dumps({"type": "message", "message_ts": message["ts"],
                                   "channel_id": channel_id, "is_ephemeral": bool(message.get("is_ephemeral", False))}),
-        "client_token": (_load_env().get("SLACK_XOXC") or os.environ.get("SLACK_XOXC")),
+        # client_token веб-клиента — его собственный id запроса, не xoxc (токен идёт в Authorization)
+        "client_token": f"web-{int(time.time() * 1000)}",
         "service_id": service_id,
     }
     if not params["client_token"]:
