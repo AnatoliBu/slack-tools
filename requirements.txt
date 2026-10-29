@@ -1,2 +1,3 @@
 slack_sdk>=3.27
 websockets>=12.0   # only needed for extract_tokens.py (CDP token extraction)
+websocket-client>=1.6   # slack click: ждёт view_opened по RTM wss

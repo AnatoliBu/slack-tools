@@ -505,61 +505,104 @@ def test_click_dry_run_is_read_only_and_describes_action():
     assert fake.count("api_call") == 0
 
 
-def test_click_builds_blocks_actions_and_view_submit_payloads_offline():
+class FakeListener:
+    """Подменяет _ViewListener: отдаёт записанное событие view_opened, подставив наш client_token."""
+
+    def __init__(self, event=None):
+        self.event, self.closed = event, False
+
+    def wait_view(self, client_token, timeout):
+        return dict(self.event, client_token=client_token) if self.event else None
+
+    def close(self):
+        self.closed = True
+
+
+def _real_view_opened():
+    """Захват 2026-10-29: RTM `view_opened` на клик house_continue (модалку НЕ сабмитили)."""
+    path = Path(__file__).parent / "fixtures" / "view_opened_house_continue.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _click_with_listener(listener, *argv, fake=None):
     url = f"https://{WS}/archives/{DEST}/p1700000000000000"
-    msg = {"ts": "1700000000.000000", "bot_id": "B000000001", "blocks": [{
-        "type": "actions", "block_id": "controls", "elements": [{
-            "type": "button", "action_id": "open", "text": {"type": "plain_text", "text": "Open"}, "value": "v1"}]}]}
-    view = {"id": "V123", "type": "modal", "callback_id": "generic", "blocks": [{
-        "type": "input", "block_id": "text", "label": {"type": "plain_text", "text": "Text"},
-        "element": {"type": "plain_text_input", "action_id": "value"}}]}
-
-    def api_response(api_method, **_kwargs):
-        if api_method == "blocks.actions":
-            return {"ok": True, "view_id": "V123"}
-        if api_method == "views.get":
-            return {"ok": True, "view": view}
-        return {"ok": True}
-
-    fake = FakeClient({"conversations_history": {"messages": [msg]}, "api_call": api_response})
-    load_env = s._load_env
-    s._load_env = lambda: {"SLACK_XOXC": "xoxc-test"}
+    msg = {"ts": "1700000000.000000", "app_id": "A000000001", "bot_id": "B000000001", "blocks": [{
+        "type": "actions", "block_id": "c", "elements": [{
+            "type": "button", "action_id": "go", "text": {"type": "plain_text", "text": "Go"}}]}]}
+    fake = fake or FakeClient({"conversations_history": {"messages": [msg]},
+                               "api_call": lambda api_method, **kw: {"ok": True}})
+    opener, load_env = s._open_view_listener, s._load_env
+    s._open_view_listener = lambda client, timeout: listener
+    s._load_env = lambda: {"SLACK_XOXC": "xoxc-secret"}
     try:
-        args = _args("click", url, "--action", "open", "--form", "text=hello", "--json")
-        out = _capture(s.cmd_click, args, client=fake)
+        return fake, _capture(s.cmd_click, _args("click", url, "--action", "go", *argv, "--json"), client=fake)
     finally:
-        s._load_env = load_env
+        s._open_view_listener, s._load_env = opener, load_env
+
+
+def test_click_returns_modal_schema_from_real_view_opened_event():
+    listener = FakeListener(_real_view_opened())
+    fake, out = _click_with_listener(listener)
     result = json.loads(out)
-    calls = [kw for method, kw in fake.calls if method == "api_call"]
-    assert [call["api_method"] for call in calls] == ["blocks.actions", "views.get", "views.submit"]
-    action = json.loads(calls[0]["params"]["actions"])[0]
-    assert action["action_id"] == "open" and action["value"] == "v1"
-    assert json.loads(calls[0]["params"]["container"])["message_ts"] == msg["ts"]
-    assert calls[0]["params"]["service_id"] == msg["bot_id"]
-    assert calls[1]["params"]["view_id"] == "V123"
-    assert calls[2]["params"]["view_id"] == "V123"
-    assert calls[2]["params"]["state"]["values"]["text"]["value"]["value"] == "hello"
-    assert result["submitted"] is True
+    assert result["submitted"] is False
+    view = result["view"]
+    assert view["id"] == "V0CD3JXPPC5" and view["callback_id"] == "house_continue_form"
+    assert view["title"] == "Продолжить разбор" and view["submit"] == "Запустить"
+    assert [(i["block_id"], i["type"], i["required"]) for i in view["inputs"]] == [
+        ("text", "plain_text_input", True), ("files", "file_input", False)]
+    assert [kw["api_method"] for m, kw in fake.calls if m == "api_call"] == ["blocks.actions"]
+    assert listener.closed
+
+
+def test_click_form_plans_views_submit_but_sends_only_with_submit_flag():
+    ev = _real_view_opened()
+    fake, out = _click_with_listener(FakeListener(ev), "--form", "text=hello")
+    result = json.loads(out)
+    assert result["submitted"] is False and "response" not in result
+    plan = result["planned_submit"]["payload"]
+    assert plan["view_id"] == "V0CD3JXPPC5" and plan["hash"] == ev["view"]["hash"]
+    assert [kw["api_method"] for m, kw in fake.calls if m == "api_call"] == ["blocks.actions"]
+
+    fake, out = _click_with_listener(FakeListener(ev), "--form", "text=hello", "--submit")
+    calls = [kw for m, kw in fake.calls if m == "api_call"]
+    assert [c["api_method"] for c in calls] == ["blocks.actions", "views.submit"]
+    assert calls[1]["params"]["view_id"] == "V0CD3JXPPC5"
+    assert calls[1]["params"]["hash"] == ev["view"]["hash"]
+    state = json.loads(calls[1]["params"]["state"])
+    assert state["values"]["text"]["v"] == {"type": "plain_text_input", "value": "hello"}
+    assert json.loads(out)["submitted"] is True
+
+
+def test_click_waits_for_view_only_for_own_client_token():
+    class FakeSocket:
+        def __init__(self, events):
+            self.events = [json.dumps(e) for e in events]
+        def settimeout(self, _): pass
+        def recv(self):
+            if not self.events:
+                raise TimeoutError
+            return self.events.pop(0)
+    foreign = dict(_real_view_opened(), client_token="web-other")
+    mine = dict(_real_view_opened(), client_token="web-mine")
+    listener = s._ViewListener.__new__(s._ViewListener)
+    listener._ws = FakeSocket([{"type": "message"}, foreign, mine])
+    listener._timeout_exc = TimeoutError
+    listener._closed_exc = ConnectionError
+    assert listener.wait_view("web-mine", 5)["client_token"] == "web-mine"
+
+
+def test_click_form_without_modal_fails_with_view_timeout():
+    try:
+        _click_with_listener(FakeListener(None), "--form", "text=hello", "--timeout", "0")
+        assert False, "form submitted without modal"
+    except s.InteractionError as exc:
+        assert exc.code == "view_timeout"
 
 
 def test_click_uses_bot_id_as_service_id_and_generated_client_token():
     """Замер 2026-10-29 на сообщении бота: app_id → invalid_service_id, bot_id → ok;
     client_token — сгенерированный id клиента, а не xoxc-токен."""
-    url = f"https://{WS}/archives/{DEST}/p1700000000000000"
-    msg = {"ts": "1700000000.000000", "app_id": "A000000001", "bot_id": "B000000001", "blocks": [{
-        "type": "actions", "block_id": "c", "elements": [{
-            "type": "button", "action_id": "go", "text": {"type": "plain_text", "text": "Go"}}]}]}
-    fake = FakeClient({"conversations_history": {"messages": [msg]},
-                       "api_call": lambda api_method, **kw: {"ok": True}})
-    load_env = s._load_env
-    s._load_env = lambda: {"SLACK_XOXC": "xoxc-secret"}
-    try:
-        try:
-            _capture(s.cmd_click, _args("click", url, "--action", "go", "--timeout", "0", "--json"), client=fake)
-        except s.InteractionError:
-            pass  # модалки нет — не предмет этого теста
-    finally:
-        s._load_env = load_env
+    fake, _ = _click_with_listener(FakeListener(None), "--timeout", "0")
     params = [kw for m, kw in fake.calls if m == "api_call"][0]["params"]
     assert params["service_id"] == "B000000001", params
     assert params["client_token"].startswith("web-") and "xoxc" not in params["client_token"], params

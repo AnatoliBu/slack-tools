@@ -680,6 +680,70 @@ def _web_interaction(client: WebClient, method: str, payload: dict) -> dict:
         raise InteractionError(code, f"Slack {method} failed ({code}){suffix}") from exc
 
 
+class _ViewListener:
+    """Ловит `view_opened` из RTM-websocket веб-клиента (rtm.connect, xoxc + cookie `d`).
+
+    Замер 2026-10-29: `blocks.actions` отвечает голым {"ok": true}; модалку, открытую ботом
+    через views.open, Slack присылает только событием `view_opened` по wss (view целиком +
+    наш client_token). Слушатель обязан подключиться ДО клика — события не буферизуются.
+    """
+
+    def __init__(self, client: WebClient, timeout: float):
+        import websocket  # websocket-client; импорт лениво — нужен только click
+        url = _web_interaction(client, "rtm.connect", {}).get("url")
+        if not url:
+            raise InteractionError("rtm_unavailable", "rtm.connect returned no websocket url")
+        cookie = (getattr(client, "headers", None) or {}).get("Cookie")
+        headers = ([f"Cookie: {cookie}"] if cookie else []) + ["Origin: https://app.slack.com"]
+        try:
+            self._ws = websocket.create_connection(url, header=headers, timeout=timeout)
+        except Exception as exc:  # websocket.WebSocketException/OSError — единый код для CLI
+            raise InteractionError("rtm_unavailable", f"cannot open Slack websocket: {exc}") from exc
+        self._timeout_exc = websocket.WebSocketTimeoutException
+        self._closed_exc = websocket.WebSocketConnectionClosedException
+        self._await_hello(timeout)
+
+    def _recv(self, deadline: float) -> Optional[dict]:
+        self._ws.settimeout(max(0.1, deadline - time.time()))
+        try:
+            raw = self._ws.recv()
+        except self._timeout_exc:
+            return None
+        except self._closed_exc as exc:
+            raise InteractionError("rtm_unavailable", "Slack websocket closed") from exc
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+
+    def _await_hello(self, timeout: float) -> None:
+        deadline = time.time() + max(timeout, 1)
+        while time.time() < deadline:
+            event = self._recv(deadline)
+            if event and event.get("type") == "hello":
+                return
+        raise InteractionError("rtm_unavailable", "Slack websocket gave no hello event")
+
+    def wait_view(self, client_token: str, timeout: float) -> Optional[dict]:
+        """Событие `view_opened` с нашим client_token или None по таймауту."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            event = self._recv(deadline)
+            if event and event.get("type") == "view_opened" and event.get("client_token") == client_token:
+                return event
+        return None
+
+    def close(self) -> None:
+        try:
+            self._ws.close()
+        except Exception:
+            pass
+
+
+def _open_view_listener(client: WebClient, timeout: float) -> _ViewListener:
+    return _ViewListener(client, timeout)
+
+
 def _view_state(view: dict, forms: dict[str, str]) -> dict:
     blocks = {b.get("block_id"): b for b in view.get("blocks") or []
               if isinstance(b, dict) and b.get("block_id")}
@@ -839,42 +903,49 @@ def cmd_click(args, client=None):
         return
     if not service_id:
         raise InteractionError("missing_service_id", "message has no app_id/bot_id; Slack's web interaction API requires the owning service_id")
-    response = _web_interaction(client, "blocks.actions", params)
-    view = response.get("view") or (response.get("data") or {}).get("view")
-    view_id = response.get("view_id") or (response.get("data") or {}).get("view_id")
-    if not view and view_id:
-        fetched = _web_interaction(client, "views.get", {
-            "view_id": view_id, "client_token": params["client_token"]})
-        view = fetched.get("view") or (fetched.get("data") or {}).get("view")
-    if not view:
-        for _ in range(args.timeout):
-            time.sleep(1)
-            view = response.get("view")
-            if view:
-                break
+    forms = {}
+    for item in args.form:
+        block_id, sep, value = item.partition("=")
+        if not sep or not block_id:
+            raise InteractionError("invalid_form", "--form must be block_id=value")
+        if block_id in forms:
+            raise InteractionError("duplicate_form", f"duplicate --form for block_id {block_id!r}")
+        forms[block_id] = value
+    # Слушатель — ДО клика: view_opened приходит только по wss и не буферизуется
+    listener = None
+    try:
+        listener = _open_view_listener(client, args.timeout)
+    except InteractionError as exc:
+        if args.form:
+            raise
+        print(f"warning: {exc.message}; modal cannot be observed", file=sys.stderr)
+    try:
+        response = _web_interaction(client, "blocks.actions", params)
+        event = listener.wait_view(params["client_token"], args.timeout) if listener else None
+    finally:
+        if listener:
+            listener.close()
+    view = (event or {}).get("view")
     if not view:
         if args.form:
-            raise InteractionError("view_timeout", f"Slack did not return an opened modal view within {args.timeout}s; response contained no view_id")
+            raise InteractionError("view_timeout", f"Slack did not open a modal (view_opened event) within {args.timeout}s")
         emit({"action": element, "submitted": True, "view": None, "response": response}, args.json)
         return
     result = {"view": _view_schema(view), "submitted": False}
-    if args.form:
-        forms = {}
-        for item in args.form:
-            block_id, sep, value = item.partition("=")
-            if not sep or not block_id:
-                raise InteractionError("invalid_form", "--form must be block_id=value")
-            if block_id in forms:
-                raise InteractionError("duplicate_form", f"duplicate --form for block_id {block_id!r}")
-            forms[block_id] = value
+    if forms:
         state_values = _view_state(view, forms)
-        submit_payload = {"view_id": view.get("id"), "state": {"values": state_values},
+        # Параметры views.submit НЕ проверены вживую (сабмит на ботах запрещён): так шлёт веб-клиент
+        submit_payload = {"view_id": view.get("id"), "hash": view.get("hash"),
+                          "state": json.dumps({"values": state_values}, ensure_ascii=False),
                           "client_token": params["client_token"]}
         if not submit_payload["view_id"]:
             raise InteractionError("missing_view_id", "Slack returned a modal without view.id; cannot submit")
-        submitted = _web_interaction(client, "views.submit", submit_payload)
-        result["submitted"] = True
-        result["response"] = submitted
+        if args.submit:
+            result["response"] = _web_interaction(client, "views.submit", submit_payload)
+            result["submitted"] = True
+        else:
+            result["planned_submit"] = {"method": "views.submit", "payload": {**submit_payload, "client_token": "<redacted>"},
+                                        "note": "not sent; pass --submit (views.submit params unverified live)"}
     emit(result, args.json)
 
 
@@ -2934,6 +3005,8 @@ def build_parser():
                    help="modal input value by input block_id; repeat for multiple fields")
     s.add_argument("--timeout", type=int, default=10,
                    help="seconds to wait for an opened modal (default 10)")
+    s.add_argument("--submit", action="store_true",
+                   help="actually send views.submit for --form (NOT verified live; starts bot work)")
     s.add_argument("--dry-run", action="store_true", help="show the planned action without sending it")
     s.set_defaults(func=cmd_click)
 

@@ -176,23 +176,31 @@ slack md     <target> <md:@file|-|inline> [--title "..."] [--theme …] [--bg �
 slack blocks <target> <JSON:@file|-|inline> [--text fallback] [--thread]
 slack buttons <message-URL> [--json]
 slack click <message-URL> --action ACTION_ID [--block BLOCK_ID] [--value VALUE] [--dry-run]
-slack click <message-URL> --action ACTION_ID [--form BLOCK_ID=VALUE ...] [--timeout 10] [--json]
+slack click <message-URL> --action ACTION_ID [--form BLOCK_ID=VALUE ...] [--submit] [--timeout 10] [--json]
 ```
 
 `buttons` lists interactive elements in message blocks (button, select, overflow, date/time picker,
 checkboxes and radio buttons), including `block_id`, `action_id`, label/text, value and available
 options. `click --dry-run` resolves the message and prints the selected action without sending it.
 Use `--value` for a selection/date/time action. A click that opens a modal returns its common view
-description and input schema without submitting it. Repeat `--form BLOCK_ID=VALUE` to fill modal
-inputs by `block_id` and submit; static option values must match the modal's declared options. For
+description and input schema without submitting it. `blocks.actions` itself answers only
+`{"ok": true}` (measured 2026-10-29; `service_id` must be the message's `bot_id`, `client_token` is
+`web-<ms>`): the modal the bot opens with `views.open` arrives as a `view_opened` event (full `view`
+plus our `client_token`) on the RTM websocket from `rtm.connect` (xoxc + cookie `d`, needs
+`websocket-client`). `click` connects before the action and waits `--timeout` seconds for it.
+Repeat `--form BLOCK_ID=VALUE` to fill modal inputs by `block_id`; without `--submit` the command
+only prints `planned_submit`. `--submit` sends `views.submit` (`view_id`, `hash`, JSON `state`,
+`client_token`) — **not verified live**: submitting starts the bot's work, so it was never run against
+a real bot. Static option values must match the modal's declared options. For
 `external_select` and `multi_external_select`, `--value` may name dynamically loaded choices that
 are absent from the view's embedded options. The submitted state follows Slack's
 `view.state.values` shape: `block_id -> action_id -> {type, value or selected_*}`.
+A captured real event is in `fixtures/view_opened_house_continue.json`.
 
 `--json` returns one JSON document. Interaction failures use `{ok:false,error,message}` and exit 1;
 examples include `action_not_found`, `missing_service_id`, `view_timeout`, `missing_required_form`,
-and Slack's own API error codes. `view_timeout` means the action response did not expose an opened
-view within `--timeout`; it does not submit an incomplete modal.
+and Slack's own API error codes. `view_timeout` means no `view_opened` event with our `client_token` arrived
+within `--timeout`; `rtm_unavailable` means the websocket could not be opened. Neither submits anything.
 
 The data contract follows Slack's [Block elements](https://docs.slack.dev/reference/block-kit/block-elements),
 [`block_actions` payload](https://docs.slack.dev/reference/interaction-payloads/block_actions-payload),
