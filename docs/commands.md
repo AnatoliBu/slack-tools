@@ -174,9 +174,31 @@ slack invite   <channel> <@name|name|U…-id> [...]
 slack table  <target> <TSV:@file|-|inline> [--data] [--caption "..."] [--align l,c,r] [--thread]
 slack md     <target> <md:@file|-|inline> [--title "..."] [--theme …] [--bg …] [--thread] [--dry-run]
 slack blocks <target> <JSON:@file|-|inline> [--text fallback] [--thread]
+slack buttons <message-URL> [--json]
+slack click <message-URL> --action ACTION_ID [--block BLOCK_ID] [--value VALUE] [--dry-run]
+slack click <message-URL> --action ACTION_ID [--form BLOCK_ID=VALUE ...] [--timeout 10] [--json]
 ```
 
-See [block-kit.md](block-kit.md) for details, limits and pitfalls.
+`buttons` lists interactive elements in message blocks (button, select, overflow, date/time picker,
+checkboxes and radio buttons), including `block_id`, `action_id`, label/text, value and available
+options. `click --dry-run` resolves the message and prints the selected action without sending it.
+Use `--value` for a selection/date/time action. A click that opens a modal returns its common view
+description and input schema without submitting it. Repeat `--form BLOCK_ID=VALUE` to fill modal
+inputs by `block_id` and submit; option values must match the modal's declared options. The submitted
+state follows Slack's `view.state.values` shape: `block_id -> action_id -> {type, value or selected_*}`.
+
+`--json` returns one JSON document. Interaction failures use `{ok:false,error,message}` and exit 1;
+examples include `action_not_found`, `missing_service_id`, `view_timeout`, `missing_required_form`,
+and Slack's own API error codes. `view_timeout` means the action response did not expose an opened
+view within `--timeout`; it does not submit an incomplete modal.
+
+The data contract follows Slack's [Block elements](https://docs.slack.dev/reference/block-kit/block-elements),
+[`block_actions` payload](https://docs.slack.dev/reference/interaction-payloads/block_actions-payload),
+[`view` interaction payload](https://docs.slack.dev/reference/interaction-payloads/view-interactions-payload),
+and [modal view](https://docs.slack.dev/surfaces/modals) specifications. The user-token transport
+(`blocks.actions` and `views.submit`) is an undocumented Slack web-client interface and is isolated
+in `_web_interaction`; it is not part of the public schema contract. Slack requires the `service_id`
+to own the source message. See [block-kit.md](block-kit.md) for posting details, limits and pitfalls.
 
 ## Discovery / meta
 

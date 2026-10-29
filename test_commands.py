@@ -359,6 +359,116 @@ def test_leave_calls_conversations_leave():
     assert fake.last("conversations_leave") == {"channel": CHAN}
 
 
+def test_interactive_elements_parse_message_actions_and_values():
+    blocks = [{"type": "actions", "block_id": "controls", "elements": [
+        {"type": "button", "action_id": "go", "text": {"type": "plain_text", "text": "Go"}, "value": "v1"},
+        {"type": "static_select", "action_id": "mode", "options": [
+            {"text": {"type": "plain_text", "text": "Deep"}, "value": "deeper"}]},
+        {"type": "overflow", "action_id": "more", "options": []},
+        {"type": "datepicker", "action_id": "date"},
+        {"type": "timepicker", "action_id": "time"},
+        {"type": "checkboxes", "action_id": "checks", "options": []},
+        {"type": "radio_buttons", "action_id": "radio", "options": []},
+    ]}, {"type": "section", "block_id": "accessory", "accessory": {
+        "type": "users_select", "action_id": "user"}}]
+    rows = s._interactive_elements(blocks)
+    assert [r["action_id"] for r in rows] == ["go", "mode", "more", "date", "time", "checks", "radio", "user"]
+    assert rows[0]["block_id"] == "controls"
+    assert rows[0]["text"] == "Go" and rows[0]["value"] == "v1"
+    assert rows[1]["options"][0]["value"] == "deeper"
+
+
+def test_view_schema_and_state_are_keyed_by_block_then_action():
+    view = {"id": "V1", "callback_id": "generic_form", "type": "modal",
+            "title": {"text": "Form"}, "submit": {"text": "Submit"}, "blocks": [
+        {"type": "input", "block_id": "text", "label": {"text": "Text"}, "element":
+         {"type": "plain_text_input", "action_id": "value"}},
+        {"type": "input", "block_id": "mode", "optional": True, "label": {"text": "Mode"}, "element":
+         {"type": "static_select", "action_id": "value", "options": [
+             {"text": {"text": "Deep"}, "value": "deeper"}]}},
+        {"type": "input", "block_id": "checks", "optional": True, "element":
+         {"type": "checkboxes", "action_id": "value", "options": [
+             {"text": {"text": "A"}, "value": "a"}, {"text": {"text": "B"}, "value": "b"}]}},
+        {"type": "input", "block_id": "when", "optional": True, "element":
+         {"type": "datepicker", "action_id": "value"}},
+    ]}
+    schema = s._view_schema(view)
+    assert schema["id"] == "V1" and schema["callback_id"] == "generic_form"
+    assert schema["inputs"][0]["required"] is True
+    assert schema["inputs"][1]["options"][0]["value"] == "deeper"
+    state = s._view_state(view, {"text": "hello", "mode": "deeper", "checks": "a,b", "when": "2026-10-29"})
+    assert state["text"]["value"]["value"] == "hello"
+    assert state["mode"]["value"]["selected_option"]["value"] == "deeper"
+    assert [o["value"] for o in state["checks"]["value"]["selected_options"]] == ["a", "b"]
+    assert state["when"]["value"]["selected_date"] == "2026-10-29"
+
+
+def test_view_state_requires_mandatory_input_and_rejects_unknown_block():
+    view = {"blocks": [{"type": "input", "block_id": "required", "element":
+                        {"type": "plain_text_input", "action_id": "value"}}]}
+    try:
+        s._view_state(view, {})
+        assert False, "missing required field accepted"
+    except s.InteractionError as exc:
+        assert exc.code == "missing_required_form"
+    try:
+        s._view_state(view, {"other": "x"})
+        assert False, "unknown block accepted"
+    except s.InteractionError as exc:
+        assert exc.code == "unknown_form_block"
+
+
+def test_click_dry_run_is_read_only_and_describes_action():
+    url = f"https://{WS}/archives/{DEST}/p1700000000000000"
+    msg = {"ts": "1700000000.000000", "blocks": [{"type": "actions", "block_id": "b",
+            "elements": [{"type": "button", "action_id": "go", "text": {"type": "plain_text", "text": "Go"}}]}]}
+    fake = FakeClient({"conversations_history": {"messages": [msg]}})
+    args = _args("click", url, "--action", "go", "--dry-run", "--json")
+    out = _capture(s.cmd_click, args, client=fake)
+    payload = json.loads(out)
+    assert payload["method"] == "blocks.actions"
+    assert json.loads(payload["payload"]["actions"])[0]["action_id"] == "go"
+    assert payload["payload"]["client_token"] == "<redacted>"
+    assert fake.count("api_call") == 0
+
+
+def test_click_builds_blocks_actions_and_view_submit_payloads_offline():
+    url = f"https://{WS}/archives/{DEST}/p1700000000000000"
+    msg = {"ts": "1700000000.000000", "bot_id": "B000000001", "blocks": [{
+        "type": "actions", "block_id": "controls", "elements": [{
+            "type": "button", "action_id": "open", "text": {"type": "plain_text", "text": "Open"}, "value": "v1"}]}]}
+    view = {"id": "V123", "type": "modal", "callback_id": "generic", "blocks": [{
+        "type": "input", "block_id": "text", "label": {"type": "plain_text", "text": "Text"},
+        "element": {"type": "plain_text_input", "action_id": "value"}}]}
+
+    def api_response(api_method, **_kwargs):
+        if api_method == "blocks.actions":
+            return {"ok": True, "view_id": "V123"}
+        if api_method == "views.get":
+            return {"ok": True, "view": view}
+        return {"ok": True}
+
+    fake = FakeClient({"conversations_history": {"messages": [msg]}, "api_call": api_response})
+    load_env = s._load_env
+    s._load_env = lambda: {"SLACK_XOXC": "xoxc-test"}
+    try:
+        args = _args("click", url, "--action", "open", "--form", "text=hello", "--json")
+        out = _capture(s.cmd_click, args, client=fake)
+    finally:
+        s._load_env = load_env
+    result = json.loads(out)
+    calls = [kw for method, kw in fake.calls if method == "api_call"]
+    assert [call["api_method"] for call in calls] == ["blocks.actions", "views.get", "views.submit"]
+    action = json.loads(calls[0]["params"]["actions"])[0]
+    assert action["action_id"] == "open" and action["value"] == "v1"
+    assert json.loads(calls[0]["params"]["container"])["message_ts"] == msg["ts"]
+    assert calls[0]["params"]["service_id"] == msg["bot_id"]
+    assert calls[1]["params"]["view_id"] == "V123"
+    assert calls[2]["params"]["view_id"] == "V123"
+    assert calls[2]["params"]["state"]["values"]["text"]["value"]["value"] == "hello"
+    assert result["submitted"] is True
+
+
 # --- send --schedule --------------------------------------------------------
 
 def test_send_schedule_uses_scheduleMessage_with_post_at():

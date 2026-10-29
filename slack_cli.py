@@ -573,6 +573,285 @@ def _message_from_url(url: str, client: WebClient) -> tuple[str, Optional[dict]]
     return channel_id, msgs[0] if msgs else None
 
 
+# ---------------------------------------------------------------------------
+# Block Kit interactive messages and modal views
+# ---------------------------------------------------------------------------
+INTERACTIVE_ELEMENT_TYPES = {
+    "button", "static_select", "external_select", "users_select",
+    "conversations_select", "channels_select", "overflow", "datepicker",
+    "timepicker", "checkboxes", "radio_buttons", "multi_static_select",
+    "multi_external_select", "multi_users_select", "multi_conversations_select",
+    "multi_channels_select", "plain_text_input", "email_text_input",
+    "url_text_input", "number_input", "rich_text_input", "file_input",
+    "datetimepicker",
+}
+
+
+class InteractionError(Exception):
+    """A user-facing failure from the undocumented Slack web interaction transport."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _interactive_elements(blocks: list[dict]) -> list[dict]:
+    found = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        candidates = list(block.get("elements") or [])
+        if isinstance(block.get("element"), dict):
+            candidates.append(block["element"])
+        if isinstance(block.get("accessory"), dict):
+            candidates.append(block["accessory"])
+        for element in candidates:
+            if not isinstance(element, dict) or element.get("type") not in INTERACTIVE_ELEMENT_TYPES:
+                continue
+            row = {
+                "block_id": block.get("block_id"),
+                "action_id": element.get("action_id"),
+                "type": element.get("type"),
+                "text": ((element.get("text") or element.get("placeholder") or {}).get("text")
+                         if isinstance(element.get("text") or element.get("placeholder"), dict)
+                         else element.get("text") or element.get("placeholder")),
+                "value": element.get("value"),
+            }
+            for key in ("options", "option_groups", "initial_option", "initial_options",
+                        "initial_date", "initial_time", "initial_conversation",
+                        "initial_channel", "initial_user", "placeholder", "confirm"):
+                if key in element:
+                    row[key] = element[key]
+            found.append(row)
+    return found
+
+
+def _view_schema(view: dict) -> dict:
+    inputs = []
+    for block in view.get("blocks") or []:
+        if not isinstance(block, dict) or block.get("type") != "input":
+            continue
+        element = block.get("element") or {}
+        options = list(element.get("options") or [])
+        for group in element.get("option_groups") or []:
+            options.extend(group.get("options") or [])
+        inputs.append({
+            "block_id": block.get("block_id"),
+            "action_id": element.get("action_id"),
+            "type": element.get("type"),
+            "label": (block.get("label") or {}).get("text"),
+            "required": not block.get("optional", False),
+            "options": options,
+            "initial_value": element.get("initial_value"),
+        })
+    return {
+        "id": view.get("id"), "callback_id": view.get("callback_id"),
+        "type": view.get("type"), "title": (view.get("title") or {}).get("text"),
+        "submit": (view.get("submit") or {}).get("text"), "inputs": inputs,
+    }
+
+
+def _action_text(element: dict) -> dict:
+    text = element.get("text")
+    if isinstance(text, dict):
+        return text
+    return {"type": "plain_text", "text": str(text or "")}
+
+
+def _web_interaction(client: WebClient, method: str, payload: dict) -> dict:
+    """Single adapter for Slack's undocumented xoxc web-client interaction API."""
+    try:
+        response = client.api_call(api_method=method, http_verb="POST", params=payload)
+        return dict(response.data) if hasattr(response, "data") else dict(response)
+    except SlackApiError as exc:
+        data = dict(exc.response.data)
+        code = data.get("error", "slack_interaction_error")
+        details = api_error_details(exc.response)
+        suffix = ": " + "; ".join(details) if details else ""
+        raise InteractionError(code, f"Slack {method} failed ({code}){suffix}") from exc
+
+
+def _view_state(view: dict, forms: dict[str, str]) -> dict:
+    blocks = {b.get("block_id"): b for b in view.get("blocks") or []
+              if isinstance(b, dict) and b.get("block_id")}
+    unknown = sorted(set(forms) - set(blocks))
+    if unknown:
+        raise InteractionError("unknown_form_block", "unknown modal block_id: " + ", ".join(unknown))
+    state = {}
+    for block_id, raw in forms.items():
+        block = blocks[block_id]
+        element = block.get("element") or {}
+        action_id = element.get("action_id")
+        etype = element.get("type")
+        if not action_id:
+            raise InteractionError("invalid_view", f"input block {block_id!r} has no action_id")
+        value: dict
+        if etype in ("plain_text_input", "email_text_input", "url_text_input", "number_input"):
+            value = {"type": etype, "value": raw}
+        elif etype in ("static_select", "external_select", "radio_buttons"):
+            options = list(element.get("options") or [])
+            for group in element.get("option_groups") or []:
+                options.extend(group.get("options") or [])
+            option = next((o for o in options if str(o.get("value")) == raw), None)
+            if not option:
+                raise InteractionError("invalid_form_value", f"{raw!r} is not an option for block {block_id!r}")
+            value = {"type": etype, "selected_option": option}
+        elif etype in ("multi_static_select", "multi_external_select", "checkboxes"):
+            requested = [part.strip() for part in raw.split(",") if part.strip()]
+            options = list(element.get("options") or [])
+            for group in element.get("option_groups") or []:
+                options.extend(group.get("options") or [])
+            selected = [o for o in options if str(o.get("value")) in requested]
+            if len(selected) != len(requested):
+                raise InteractionError("invalid_form_value", f"unknown option in {raw!r} for block {block_id!r}")
+            value = {"type": etype, "selected_options": selected}
+        elif etype == "datepicker":
+            value = {"type": etype, "selected_date": raw}
+        elif etype == "timepicker":
+            value = {"type": etype, "selected_time": raw}
+        elif etype == "users_select":
+            value = {"type": etype, "selected_user": raw}
+        elif etype == "channels_select":
+            value = {"type": etype, "selected_channel": raw}
+        elif etype == "conversations_select":
+            value = {"type": etype, "selected_conversation": raw}
+        elif etype in ("multi_users_select", "multi_channels_select", "multi_conversations_select"):
+            field = {"multi_users_select": "selected_users", "multi_channels_select": "selected_channels",
+                     "multi_conversations_select": "selected_conversations"}[etype]
+            value = {"type": etype, field: [part.strip() for part in raw.split(",") if part.strip()]}
+        else:
+            raise InteractionError("unsupported_input_type", f"unsupported modal input type {etype!r}")
+        state[block_id] = {action_id: value}
+    missing = [b.get("block_id") for b in view.get("blocks") or []
+               if isinstance(b, dict) and b.get("type") == "input"
+               and not b.get("optional", False) and b.get("block_id") not in forms]
+    if missing:
+        raise InteractionError("missing_required_form", "required modal fields missing: " + ", ".join(missing))
+    return state
+
+
+def cmd_buttons(args, client=None):
+    client = client or _make_client()
+    _, message = _message_from_url(args.url, client)
+    if not message:
+        raise InteractionError("message_not_found", "Slack message not found")
+    rows = _interactive_elements(message.get("blocks") or [])
+    payload = {"url": args.url, "ts": message.get("ts"), "elements": rows}
+    if args.json:
+        emit_json(payload)
+    else:
+        for row in rows:
+            print(" ".join(f"{k}={row.get(k)}" for k in ("block_id", "action_id", "text", "value")))
+
+
+def cmd_click(args, client=None):
+    client = client or _make_client()
+    channel_id, message = _message_from_url(args.url, client)
+    if not message:
+        raise InteractionError("message_not_found", "Slack message not found")
+    matches = [e for e in _interactive_elements(message.get("blocks") or [])
+               if e.get("action_id") == args.action and (not args.block or e.get("block_id") == args.block)]
+    if len(matches) != 1:
+        code = "action_not_found" if not matches else "action_ambiguous"
+        raise InteractionError(code, f"expected one matching action_id={args.action!r}; found {len(matches)}")
+    element = matches[0]
+    service_id = message.get("app_id") or message.get("bot_id")
+    etype = element.get("type")
+    if etype not in ("button", "overflow") and not args.value:
+        raise InteractionError("selection_required", f"{etype} needs a selected value; pass --value")
+    action = {k: element.get(k) for k in ("action_id", "block_id", "type", "value") if element.get(k) is not None}
+    action["text"] = _action_text(element)
+    if args.value:
+        raw_value = args.value
+        options = list(element.get("options") or [])
+        for group in element.get("option_groups") or []:
+            options.extend(group.get("options") or [])
+        if etype in ("static_select", "external_select", "overflow", "radio_buttons"):
+            option = next((o for o in options if str(o.get("value")) == raw_value), None)
+            if not option:
+                raise InteractionError("invalid_action_value", f"{raw_value!r} is not an option for action {args.action!r}")
+            action["selected_option"] = option
+        elif etype in ("multi_static_select", "multi_external_select", "checkboxes"):
+            wanted = [part.strip() for part in raw_value.split(",") if part.strip()]
+            selected = [o for o in options if str(o.get("value")) in wanted]
+            if len(selected) != len(wanted):
+                raise InteractionError("invalid_action_value", f"unknown option in {raw_value!r} for action {args.action!r}")
+            action["selected_options"] = selected
+        elif etype == "datepicker":
+            action["selected_date"] = raw_value
+        elif etype == "timepicker":
+            action["selected_time"] = raw_value
+        elif etype == "users_select":
+            action["selected_user"] = raw_value
+        elif etype == "channels_select":
+            action["selected_channel"] = raw_value
+        elif etype == "conversations_select":
+            action["selected_conversation"] = raw_value
+        elif etype.startswith("multi_") and etype.endswith("_select"):
+            field = {"multi_users_select": "selected_users", "multi_channels_select": "selected_channels",
+                     "multi_conversations_select": "selected_conversations"}.get(etype)
+            if not field:
+                raise InteractionError("unsupported_action_type", f"unsupported selection type {etype!r}")
+            action[field] = [part.strip() for part in raw_value.split(",") if part.strip()]
+        else:
+            raise InteractionError("unsupported_action_type", f"--value is not supported for {etype!r}")
+    params = {
+        "actions": json.dumps([action], ensure_ascii=False),
+        "container": json.dumps({"type": "message", "message_ts": message["ts"],
+                                  "channel_id": channel_id, "is_ephemeral": bool(message.get("is_ephemeral", False))}),
+        "client_token": (_load_env().get("SLACK_XOXC") or os.environ.get("SLACK_XOXC")),
+        "service_id": service_id,
+    }
+    if not params["client_token"]:
+        raise InteractionError("missing_client_token", "xoxc client token is unavailable")
+    if args.dry_run:
+        preview = dict(params)
+        preview["client_token"] = "<redacted>"
+        emit({"method": "blocks.actions", "payload": preview,
+              "missing_service_id": not bool(service_id), "forms": args.form}, args.json)
+        return
+    if not service_id:
+        raise InteractionError("missing_service_id", "message has no app_id/bot_id; Slack's web interaction API requires the owning service_id")
+    response = _web_interaction(client, "blocks.actions", params)
+    view = response.get("view") or (response.get("data") or {}).get("view")
+    view_id = response.get("view_id") or (response.get("data") or {}).get("view_id")
+    if not view and view_id:
+        fetched = _web_interaction(client, "views.get", {
+            "view_id": view_id, "client_token": params["client_token"]})
+        view = fetched.get("view") or (fetched.get("data") or {}).get("view")
+    if not view:
+        for _ in range(args.timeout):
+            time.sleep(1)
+            view = response.get("view")
+            if view:
+                break
+    if not view:
+        if args.form:
+            raise InteractionError("view_timeout", f"Slack did not return an opened modal view within {args.timeout}s; response contained no view_id")
+        emit({"action": element, "submitted": True, "view": None, "response": response}, args.json)
+        return
+    result = {"view": _view_schema(view), "submitted": False}
+    if args.form:
+        forms = {}
+        for item in args.form:
+            block_id, sep, value = item.partition("=")
+            if not sep or not block_id:
+                raise InteractionError("invalid_form", "--form must be block_id=value")
+            if block_id in forms:
+                raise InteractionError("duplicate_form", f"duplicate --form for block_id {block_id!r}")
+            forms[block_id] = value
+        state_values = _view_state(view, forms)
+        submit_payload = {"view_id": view.get("id"), "state": {"values": state_values},
+                          "client_token": params["client_token"]}
+        if not submit_payload["view_id"]:
+            raise InteractionError("missing_view_id", "Slack returned a modal without view.id; cannot submit")
+        submitted = _web_interaction(client, "views.submit", submit_payload)
+        result["submitted"] = True
+        result["response"] = submitted
+    emit(result, args.json)
+
+
 def _messages_for_target(target: str, client: WebClient, limit: int,
                          force_thread: bool = False) -> tuple[str, list[dict]]:
     if "slack.com/archives/" in target and "thread_ts" in target:
@@ -2613,6 +2892,22 @@ def build_parser():
     s.add_argument("--no-notify", dest="notify", action="store_false")
     s.set_defaults(func=cmd_blocks)
 
+    s = addp("buttons", help="list interactive Block Kit elements in a message")
+    s.add_argument("url", help="message archive URL")
+    s.set_defaults(func=cmd_buttons)
+
+    s = addp("click", help="invoke a message Block Kit action; optionally inspect/fill its modal")
+    s.add_argument("url", help="message archive URL")
+    s.add_argument("--action", required=True, help="action_id")
+    s.add_argument("--block", help="block_id when action_id is repeated")
+    s.add_argument("--value", help="selected option/value for select, date, time, or choice controls")
+    s.add_argument("--form", action="append", default=[], metavar="BLOCK_ID=VALUE",
+                   help="modal input value by input block_id; repeat for multiple fields")
+    s.add_argument("--timeout", type=int, default=10,
+                   help="seconds to wait for an opened modal (default 10)")
+    s.add_argument("--dry-run", action="store_true", help="show the planned action without sending it")
+    s.set_defaults(func=cmd_click)
+
     s = addp("forward", help="forward a message (getPermalink + repost with unfurl)")
     s.add_argument("src", help="source archive URL, or a target (with --ts)")
     s.add_argument("dest", help="destination #channel | @user | C123 | URL")
@@ -2753,6 +3048,11 @@ def main():
             _emit_error_json({"ok": False, "error": e.code, "message": e.headline,
                               "hints": e.hints})
         sys.exit(2)
+    except InteractionError as e:
+        print(f"ERROR: Slack interaction [{e.code}]: {e.message}", file=sys.stderr)
+        if getattr(args, "json", False):
+            _emit_error_json({"ok": False, "error": e.code, "message": e.message})
+        sys.exit(1)
     except SlackApiError as e:
         print(f"ERROR: Slack API: {e.response.get('error')}", file=sys.stderr)
         for line in api_error_details(e.response):
