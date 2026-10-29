@@ -652,6 +652,7 @@ def _view_schema(view: dict) -> dict:
             "required": not block.get("optional", False),
             "options": options,
             "initial_value": element.get("initial_value"),
+            **{key: element[key] for key in ("max_length", "min_length") if key in element},
         })
     return {
         "id": view.get("id"), "callback_id": view.get("callback_id"),
@@ -754,6 +755,13 @@ def _view_state(view: dict, forms: dict[str, str]) -> dict:
     for block_id, raw in forms.items():
         block = blocks[block_id]
         element = block.get("element") or {}
+        value_len = len(raw)
+        if element.get("max_length") is not None and value_len > element["max_length"]:
+            raise InteractionError("form_too_long",
+                                   f"поле {block_id}: {value_len} символов, лимит {element['max_length']}")
+        if element.get("min_length") is not None and value_len < element["min_length"]:
+            raise InteractionError("form_too_short",
+                                   f"поле {block_id}: {value_len} символов, лимит {element['min_length']}")
         action_id = element.get("action_id")
         etype = element.get("type")
         if not action_id:
@@ -811,13 +819,63 @@ def _view_state(view: dict, forms: dict[str, str]) -> dict:
     return state
 
 
+def _interactive_thread_message(channel_id: str, message: dict, client: WebClient,
+                                action_id: str | None = None, block_id: str | None = None):
+    """Resolve an interactive status message in the target message's thread."""
+    rows = _interactive_elements(message.get("blocks") or [])
+    if action_id is not None:
+        rows = [row for row in rows if row.get("action_id") == action_id
+                and (not block_id or row.get("block_id") == block_id)]
+    if rows:
+        return message, rows, False
+
+    root_ts = message.get("thread_ts") or message.get("ts")
+    is_thread = bool(message.get("thread_ts") or message.get("reply_count"))
+    if not is_thread or not root_ts:
+        return message, [], False
+    candidates = []
+    cursor = None
+    while True:
+        response = _call("conversations_replies", _client=client, channel=channel_id,
+                         ts=root_ts, limit=200, **({"cursor": cursor} if cursor else {}))
+        candidates.extend(response.get("messages", []) or [])
+        next_cursor = (response.get("response_metadata") or {}).get("next_cursor")
+        if not next_cursor or next_cursor == cursor:
+            break
+        cursor = next_cursor
+    candidates.sort(key=lambda item: item.get("ts", "0"))
+    for candidate in reversed(candidates):
+        candidate_rows = _interactive_elements(candidate.get("blocks") or [])
+        if action_id is not None:
+            candidate_rows = [row for row in candidate_rows if row.get("action_id") == action_id
+                              and (not block_id or row.get("block_id") == block_id)]
+        if candidate_rows:
+            return candidate, candidate_rows, candidate.get("ts") != message.get("ts")
+    return message, [], False
+
+
+def _announce_resolved_message(channel_id: str, message: dict, root_ts: str | None,
+                               original_ts: str, as_json: bool) -> dict:
+    if message.get("ts") == original_ts:
+        return {}
+    resolved = {"resolved_ts": message.get("ts"),
+                "resolved_url": _msg_permalink(channel_id, message.get("ts"), root_ts)}
+    if not as_json:
+        print(f"resolved_ts={resolved['resolved_ts']} resolved_url={resolved['resolved_url']}",
+              file=sys.stderr)
+    return resolved
+
+
 def cmd_buttons(args, client=None):
     client = client or _make_client()
-    _, message = _message_from_url(args.url, client)
+    channel_id, message = _message_from_url(args.url, client)
     if not message:
         raise InteractionError("message_not_found", "Slack message not found")
-    rows = _interactive_elements(message.get("blocks") or [])
-    payload = {"url": args.url, "ts": message.get("ts"), "elements": rows}
+    original_ts = message.get("ts")
+    root_ts = message.get("thread_ts") or original_ts
+    message, rows, _ = _interactive_thread_message(channel_id, message, client)
+    resolution = _announce_resolved_message(channel_id, message, root_ts, original_ts, args.json)
+    payload = {"url": args.url, "ts": message.get("ts"), "elements": rows, **resolution}
     if args.json:
         emit_json(payload)
     else:
@@ -830,8 +888,11 @@ def cmd_click(args, client=None):
     channel_id, message = _message_from_url(args.url, client)
     if not message:
         raise InteractionError("message_not_found", "Slack message not found")
-    matches = [e for e in _interactive_elements(message.get("blocks") or [])
-               if e.get("action_id") == args.action and (not args.block or e.get("block_id") == args.block)]
+    original_ts = message.get("ts")
+    root_ts = message.get("thread_ts") or original_ts
+    message, matches, _ = _interactive_thread_message(channel_id, message, client,
+                                                       args.action, args.block)
+    resolution = _announce_resolved_message(channel_id, message, root_ts, original_ts, args.json)
     if len(matches) != 1:
         code = "action_not_found" if not matches else "action_ambiguous"
         raise InteractionError(code, f"expected one matching action_id={args.action!r}; found {len(matches)}")
@@ -899,7 +960,8 @@ def cmd_click(args, client=None):
         preview = dict(params)
         preview["client_token"] = "<redacted>"
         emit({"method": "blocks.actions", "payload": preview,
-              "missing_service_id": not bool(service_id), "forms": args.form}, args.json)
+              "missing_service_id": not bool(service_id), "forms": args.form,
+              **resolution}, args.json)
         return
     if not service_id:
         raise InteractionError("missing_service_id", "message has no app_id/bot_id; Slack's web interaction API requires the owning service_id")
@@ -910,6 +972,14 @@ def cmd_click(args, client=None):
             raise InteractionError("invalid_form", "--form must be block_id=value")
         if block_id in forms:
             raise InteractionError("duplicate_form", f"duplicate --form for block_id {block_id!r}")
+        if value.startswith("@@"):
+            value = value[1:]
+        elif value.startswith("@"):
+            path = Path(value[1:]).expanduser()
+            try:
+                value = path.read_text(encoding="utf-8")
+            except FileNotFoundError as exc:
+                raise InteractionError("form_file_not_found", f"form file not found: {path}") from exc
         forms[block_id] = value
     # Слушатель — ДО клика: view_opened приходит только по wss и не буферизуется
     listener = None
@@ -929,9 +999,10 @@ def cmd_click(args, client=None):
     if not view:
         if args.form:
             raise InteractionError("view_timeout", f"Slack did not open a modal (view_opened event) within {args.timeout}s")
-        emit({"action": element, "submitted": True, "view": None, "response": response}, args.json)
+        emit({"action": element, "submitted": True, "view": None, "response": response,
+              **resolution}, args.json)
         return
-    result = {"view": _view_schema(view), "submitted": False}
+    result = {"view": _view_schema(view), "submitted": False, **resolution}
     if forms:
         state_values = _view_state(view, forms)
         # Параметры views.submit НЕ проверены вживую (сабмит на ботах запрещён): так шлёт веб-клиент
@@ -2443,7 +2514,7 @@ def cmd_wait(args, client=None):
     channel_id, thread_ts = resolve_target_and_thread(args.target, None, client)
     after_ts = args.after_ts or (_thread_latest_ts(channel_id, thread_ts, client) if thread_ts
                                  else _baseline_ts(channel_id, client))
-    who, marker = args.from_user, args.while_contains
+    who, marker, until_marker = args.from_user, args.while_contains, args.until_contains
     deadline = time.time() + args.timeout
     new: list[dict] = []
     while True:
@@ -2456,13 +2527,22 @@ def cmd_wait(args, client=None):
         new = sorted((m for m in resp.get("messages", []) or []
                       if m.get("ts", "0") > after_ts and _wait_author_ok(m, who)),
                      key=lambda m: m.get("ts", "0"))
-        if new and not _wait_still_busy(new[-1], marker):
+        until_seen = any(_wait_still_busy(message, until_marker) for message in new)
+        if (new and not _wait_still_busy(new[-1], marker)
+                and (not until_marker or until_seen)):
             _print_new_messages(new, channel_id, client, args.json)
             return
         if time.time() >= deadline:
             break
         time.sleep(min(args.interval, max(0.0, deadline - time.time())))
-    state = f"newest message still contains {marker!r}" if new else "no new messages"
+    state_parts = []
+    if not new:
+        state_parts.append("no new messages")
+    elif marker and _wait_still_busy(new[-1], marker):
+        state_parts.append(f"newest message still contains {marker!r}")
+    if until_marker and not any(_wait_still_busy(message, until_marker) for message in new):
+        state_parts.append(f"no new message contains {until_marker!r}")
+    state = "; ".join(state_parts)
     where = f"{channel_id} thread {thread_ts}" if thread_ts else channel_id
     print(f"[timeout] {state} in {where} after ts={after_ts} within {args.timeout}s",
           file=sys.stderr)
@@ -3008,7 +3088,7 @@ def build_parser():
     s.add_argument("--block", help="block_id when action_id is repeated")
     s.add_argument("--value", help="selected option/value for select, date, time, or choice controls")
     s.add_argument("--form", action="append", default=[], metavar="BLOCK_ID=VALUE",
-                   help="modal input value by input block_id; repeat for multiple fields")
+                   help="modal input value by block_id; use @path to read UTF-8 file, @@ for literal @; repeat for fields")
     s.add_argument("--timeout", type=int, default=10,
                    help="seconds to wait for an opened modal (default 10)")
     s.add_argument("--submit", action="store_true",
@@ -3067,6 +3147,8 @@ def build_parser():
     s.add_argument("--while-contains", dest="while_contains", metavar="MARKER",
                    help="keep waiting while the newest matching message contains MARKER "
                         "(bots that edit one message in place, e.g. ':processing:')")
+    s.add_argument("--until-contains", dest="until_contains", metavar="MARKER",
+                   help="wait until a new matching message contains MARKER in text or blocks")
     s.add_argument("--timeout", type=float, default=60.0, help="seconds before giving up")
     s.add_argument("--interval", type=float, default=3.0, help="poll interval seconds")
     s.add_argument("--after-ts", dest="after_ts",

@@ -573,6 +573,80 @@ def test_click_form_plans_views_submit_but_sends_only_with_submit_flag():
     assert json.loads(out)["submitted"] is True
 
 
+def _limited_view_event(**limits):
+    event = _real_view_opened()
+    element = next(block["element"] for block in event["view"]["blocks"]
+                   if block.get("block_id") == "text")
+    element.update(limits)
+    return event
+
+
+def test_click_form_max_length_and_min_length_validation():
+    event = _limited_view_event(max_length=3, min_length=2)
+    fake, out = _click_with_listener(FakeListener(event), "--form", "text=éab", "--submit")
+    assert json.loads(out)["submitted"] is True
+    assert fake.count("api_call") == 2
+
+
+def test_click_form_reads_file_and_unescapes_literal_at():
+    event = _real_view_opened()
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "steer.txt"
+        path.write_text("hello\nworld", encoding="utf-8")
+        fake, out = _click_with_listener(FakeListener(event), "--form", f"text=@{path}")
+    payload = json.loads(out)["planned_submit"]["payload"]
+    assert json.loads(payload["state"])["values"]["text"]["v"]["value"] == "hello\nworld"
+    assert fake.count("api_call") == 1
+
+    _, out = _click_with_listener(FakeListener(event), "--form", "text=@@literal")
+    payload = json.loads(out)["planned_submit"]["payload"]
+    assert json.loads(payload["state"])["values"]["text"]["v"]["value"] == "@literal"
+
+
+def test_click_form_missing_file_has_specific_error():
+    event = _real_view_opened()
+    try:
+        _click_with_listener(FakeListener(event), "--form", "text=@/definitely/missing/form.txt")
+    except s.InteractionError as exc:
+        assert exc.code == "form_file_not_found"
+    else:
+        raise AssertionError("expected form_file_not_found")
+
+
+def test_click_form_length_limits_are_errors_and_block_submit():
+    cases = [("max_length", 3, "éabc", "form_too_long", True),
+             ("min_length", 3, "é", "form_too_short", False)]
+    for key, bound, value, code, submit in cases:
+        event = _limited_view_event(**{key: bound})
+        fake = FakeClient({"conversations_history": {"messages": [{
+            "ts": "1700000000.000000", "app_id": "A1", "bot_id": "B1", "blocks": [{
+                "type": "actions", "block_id": "c", "elements": [{"type": "button", "action_id": "go"}]}]}]},
+            "api_call": lambda api_method, **kw: {"ok": True}})
+        url = f"https://{WS}/archives/{DEST}/p1700000000000000"
+        opener, load_env = s._open_view_listener, s._load_env
+        s._open_view_listener, s._load_env = lambda *_: FakeListener(event), lambda: {"SLACK_XOXC": "x"}
+        try:
+            try:
+                argv = ["click", url, "--action", "go", "--form", f"text={value}"]
+                if submit:
+                    argv.append("--submit")
+                s.cmd_click(_args(*argv), client=fake)
+            except s.InteractionError as exc:
+                assert exc.code == code
+                assert "поле text" in exc.message and "символов" in exc.message
+            else:
+                raise AssertionError(f"expected {code}")
+        finally:
+            s._open_view_listener, s._load_env = opener, load_env
+        assert [kw["api_method"] for method, kw in fake.calls if method == "api_call"] == ["blocks.actions"]
+
+
+def test_view_schema_includes_input_length_limits():
+    view = _limited_view_event(max_length=1200, min_length=1)["view"]
+    text_input = s._view_schema(view)["inputs"][0]
+    assert text_input["max_length"] == 1200 and text_input["min_length"] == 1
+
+
 def test_click_waits_for_view_only_for_own_client_token():
     class FakeSocket:
         def __init__(self, events):
@@ -756,6 +830,47 @@ def test_wait_while_contains_checks_blocks_not_only_text():
         assert e.code == 3
 
 
+def test_wait_until_contains_ignores_new_message_without_marker():
+    states = iter([{"ts": "1700000200.000000", "user": "U9", "text": "echo"},
+                   {"ts": "1700000201.000000", "user": "U9", "blocks": [{
+                       "type": "section", "text": {"type": "mrkdwn", "text": "Результат анализа готов"}}]}])
+
+    def replies(**_):
+        return {"messages": [next(states)]}
+
+    fake = FakeClient({"conversations_replies": replies})
+    args = _args("wait", THREAD_URL, "--after-ts", "1700000150.000000",
+                 "--until-contains", "Результат анализа", "--interval", "0", "--timeout", "5")
+    out = _capture(s.cmd_wait, args, client=fake)
+    assert "Результат анализа" in out
+    assert fake.count("conversations_replies") == 2
+
+
+def test_wait_until_contains_combines_with_from_filter():
+    msgs = [{"ts": "1700000200.000000", "user": "U1", "text": "Результат анализа fake"},
+            {"ts": "1700000201.000000", "user": "U9", "text": "Результат анализа real"}]
+    fake = FakeClient({"conversations_replies": {"messages": msgs}})
+    args = _args("wait", THREAD_URL, "--after-ts", "1700000150.000000", "--from", "U9",
+                 "--until-contains", "Результат анализа", "--timeout", "5")
+    out = _capture(s.cmd_wait, args, client=fake)
+    assert "real" in out and "fake" not in out
+
+
+def test_wait_until_and_while_contains_require_final_marker_and_clear_busy_marker():
+    states = iter([{"ts": "1700000200.000000", "user": "U9", "text": "Результат анализа :processing:"},
+                   {"ts": "1700000201.000000", "user": "U9", "text": "Результат анализа готов"}])
+
+    def replies(**_):
+        return {"messages": [next(states)]}
+
+    fake = FakeClient({"conversations_replies": replies})
+    args = _args("wait", THREAD_URL, "--after-ts", "1700000150.000000", "--from", "U9",
+                 "--until-contains", "Результат анализа", "--while-contains", ":processing:",
+                 "--interval", "0", "--timeout", "5")
+    out = _capture(s.cmd_wait, args, client=fake)
+    assert "готов" in out and fake.count("conversations_replies") == 2
+
+
 # --- listen -----------------------------------------------------------------
 
 def test_listen_emits_ndjson_for_new_messages():
@@ -861,6 +976,45 @@ def test_buttons_on_unknown_message_is_not_found_not_another_message():
         assert "not_found" in str(e) or getattr(e, "code", "") == "message_not_found", e
     else:
         raise AssertionError("expected message_not_found")
+
+
+def test_buttons_on_thread_root_resolves_latest_message_with_elements():
+    root = {"ts": "1700000000.000000", "reply_count": 2, "latest_reply": "1700000002.000000"}
+    older = {"ts": "1700000001.000000", "thread_ts": root["ts"], "blocks": [{
+        "type": "actions", "block_id": "old", "elements": [{"type": "button", "action_id": "old_action"}]}]}
+    latest = {"ts": "1700000002.000000", "thread_ts": root["ts"], "blocks": [{
+        "type": "actions", "block_id": "new", "elements": [{"type": "button", "action_id": "new_action"}]}]}
+    fake = FakeClient({"conversations_history": {"messages": [root]},
+                       "conversations_replies": {"messages": [root, older, latest]}})
+    url = f"https://{WS}/archives/{CHAN}/p1700000000000000"
+    out = json.loads(_capture(s.cmd_buttons, _args("buttons", url, "--json"), client=fake))
+    assert out["ts"] == latest["ts"] and out["resolved_ts"] == latest["ts"]
+    assert out["elements"][0]["action_id"] == "new_action"
+    assert "resolved_url" in out
+
+
+def test_click_on_thread_root_resolves_latest_message_with_requested_action():
+    root = {"ts": "1700000000.000000", "reply_count": 2, "latest_reply": "1700000002.000000"}
+    other = {"ts": "1700000001.000000", "thread_ts": root["ts"], "blocks": [{
+        "type": "actions", "elements": [{"type": "button", "action_id": "other"}]}]}
+    first = {"ts": "1700000002.000000", "thread_ts": root["ts"], "app_id": "A1", "bot_id": "B1", "blocks": [{
+        "type": "actions", "elements": [{"type": "button", "action_id": "go"}]}]}
+    latest = {"ts": "1700000003.000000", "thread_ts": root["ts"], "app_id": "A1", "bot_id": "B1", "blocks": [{
+        "type": "actions", "elements": [{"type": "button", "action_id": "go"}]}]}
+    fake = FakeClient({"conversations_history": {"messages": [root]},
+                       "conversations_replies": {"messages": [root, other, first, latest]},
+                       "api_call": lambda api_method, **kw: {"ok": True}})
+    event = FakeListener(None)
+    opener, load_env = s._open_view_listener, s._load_env
+    s._open_view_listener, s._load_env = lambda *_: event, lambda: {"SLACK_XOXC": "x"}
+    url = f"https://{WS}/archives/{CHAN}/p1700000000000000"
+    try:
+        out = _capture(s.cmd_click, _args("click", url, "--action", "go", "--dry-run", "--json"), client=fake)
+    finally:
+        s._open_view_listener, s._load_env = opener, load_env
+    preview = json.loads(out)
+    assert json.loads(preview["payload"]["container"])["message_ts"] == latest["ts"]
+    assert preview["resolved_ts"] == latest["ts"] and "resolved_url" in preview
 
 
 def test_no_split_over_slack_limit_is_refused_not_posted():

@@ -89,6 +89,10 @@ slack stats #general --top 5                     # top senders, per-day, files/r
 slack wait #general --timeout 120                # block for a new message (exit 3 = timeout)
 slack wait <thread URL> --from U0B2YLD53QU --while-contains ":processing:" --timeout 1800
                                                  # in a thread; one author; until the bot's message is finished
+slack wait <thread URL> --from U0B2YLD53QU --until-contains "Результат анализа" --timeout 1800
+                                                 # wait for a specific final response
+slack buttons <thread-root-URL> --json         # list controls, including controls on status replies
+slack click <thread-root-URL> --action house_steer --form text=@steer.txt --form mode=continue --submit
 slack listen #general                            # NDJSON stream of new msgs (polling; no RTM)
 slack subscribe <thread URL> --label PLAT-4731   # follow a thread; `subscriptions`, `unsubscribe`
 slack watch                                      # exit 0 on the first new replies in subscribed threads
@@ -104,7 +108,32 @@ slack me                                         # whoami
 > `wait`/`listen` poll `conversations.history` (`wait <message URL>` — `conversations.replies`
 > of that thread) — browser (`xoxc`) tokens can't use RTM/Socket Mode, so there's no true streaming.
 > `--while-contains` exists because bots such as Dr. House edit one message in place
-> (`:processing:` → result): "a new message appeared" is not "the bot has finished".
+> (`:processing:` → result). `--until-contains MARKER` waits for a new matching message
+> whose text or blocks contain the marker; combine it with `--from` and `--while-contains`
+> to wait for a final response after processing ends.
+
+### Bot buttons and modal forms
+
+`slack buttons <message-URL>` lists a message's interactive Block Kit controls.
+`slack click <message-URL> --action ACTION_ID` invokes a control; `--form BLOCK_ID=VALUE`
+fills modal fields and plans `views.submit`. Add `--submit` to send the form. A form value
+can come from a UTF-8 file with `BLOCK_ID=@path` (relative to the current directory; `~`
+expands); use `BLOCK_ID=@@text` for a literal value starting with `@`. The modal schema
+shows `min_length` and `max_length`; values outside those limits are rejected before submit.
+
+When the URL points to a thread root or reply without the requested control, `buttons` and
+`click` look through the thread and choose the latest message with interactive elements (for
+`click`, the requested `action_id`). The selected `resolved_ts` and URL are reported.
+
+For Dr. House, the `house_steer_form` `text` field allows up to 1200 characters. Put the
+instruction in `steer.txt`, then submit and wait for the final answer:
+
+```bash
+slack click <thread-root-URL> --action house_steer --form text=@steer.txt \
+  --form mode=continue --submit
+slack wait <thread-root-URL> --from U0B2YLD53QU \
+  --until-contains "Результат анализа" --timeout 1800
+```
 
 Run any subcommand with `-h` for full flags. Full reference → [docs/commands.md](docs/commands.md).
 
