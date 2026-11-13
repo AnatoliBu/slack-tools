@@ -249,6 +249,9 @@ def slack_retry(call, *, sleep=time.sleep, jitter=random.random, attempts: int =
     raise SlackRetryExhausted("unreachable")
 
 
+DEFAULT_TIMEOUT_S = 8 * 3600
+
+
 def main(argv: list[str] | None = None) -> int:
     """Compatibility CLI: one question is a one-item batch using the batch sender and watcher."""
     ap = argparse.ArgumentParser(prog="slack-ask", description=(__doc__ or "").split("\n")[0])
@@ -257,7 +260,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--yesno", action="store_true", help="вопрос ок / не ок")
     ap.add_argument("--notify", action="store_true", help="уведомление без ожидания ответа")
     ap.add_argument("--id", dest="qid", help="id вопроса (TASK-901, BUG-304)")
-    ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S)
+    ap.add_argument("--card-timeout", type=int, default=None,
+                    help="срок жизни самой карточки в секундах (по умолчанию ≥ 8 ч; выход ожидающего по --timeout карточку не гасит)")
     ap.add_argument("--channels", choices=sorted(CHANNEL_MODES))
     ap.add_argument("--slack-text", choices=sorted(SLACK_TEXT_MODES), default="copy")
     ap.add_argument("--telegram-after", type=int)
@@ -297,7 +302,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         item["labels"] = {"approve": "ок", "reject": "не ок"}
     # Keep the historical three channel choices, now represented by the same batch transport.
-    spec = {"title": first_line[:100], "channels": channels, "timeout": a.timeout,
+    # Card lifetime is at least DEFAULT_TIMEOUT_S (8h) unless --card-timeout is explicitly set, so a shorter CLI wait
+    # (--timeout) never expires the card before the owner can answer.
+    card_timeout = a.card_timeout if a.card_timeout is not None else max(DEFAULT_TIMEOUT_S, a.timeout)
+    spec = {"title": first_line[:100], "channels": channels, "timeout": card_timeout,
             "slack_text": a.slack_text, "slack_text_reason": "standalone compatibility mode" if a.slack_text != "copy" else None,
             "approve_only": True, "items": [item]}
     args = argparse.Namespace(owner=a.owner, origin=a.origin, slack_text=a.slack_text)
@@ -345,6 +353,15 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(max(1, a.poll))
             current = load_batch(name)["items"][0]
     waited = int(time.time() - started)
+    latest_state = load_batch(name)
+    current = latest_state["items"][0]
+    if current.get("rounds"):
+        permalink_out = (current["rounds"][-1]["slack"].get("permalink")
+                         or ((current.get("result") or {}).get("permalink") if isinstance(current.get("result"), dict) else None)
+                         or permalink_out)
+    if latest_state.get("owner_auth_failed") and current["status"] in OPEN + BUSY + WAITING + ("pending",):
+        print("slack-ask: пользовательский Slack-токен отклонён; чтение копии невозможно", file=sys.stderr)
+        return 7
     choice = current.get("choice")
     decision = (current.get("last") or {}).get("decision")
     if current["status"] in OPEN + BUSY + WAITING + ("expired",) or current["status"] == "pending":
@@ -411,6 +428,48 @@ def approval_problems(question: dict, replies: list[dict], bot_user: str, owner:
     return probs
 
 
+def _verify_item_round(name: str, state: dict, item: dict, rnd: dict, a, expected_link: str | None = None) -> int:
+    try:
+        question = Path(rnd["snapshot"]).read_text(encoding="utf-8")
+    except OSError:
+        question = ""
+    # the owner sees «*<id> · <title>*» above the payload — the key and the action live there too (2026-11-05)
+    title = item.get("title") or (item.get("labels") or {}).get("title", "")
+    question = f"{item.get('id', '')} · {title}\n{question}"
+    problems = []
+    # a ✅/❌ card without options is a yes/no question whether or not --yesno set the flag (2026-11-05:
+    # six approve_only «Jira <KEY>: Reopen» cards refused, the owner had to approve twice)
+    if item.get("options") or not (item.get("yesno") or item.get("approve_only")):
+        problems.append("вопрос не помечен как --yesno")
+    if a.key not in question:
+        problems.append(f"в вопросе нет ключа {a.key}")
+    for word in a.require:
+        if word.lower() not in question.lower():
+            problems.append(f"в вопросе нет слова «{word}»")
+    if time.time() - float(rnd.get("sent_epoch", 0)) > APPROVAL_MAX_AGE_S:
+        problems.append("вопросу больше 24 ч — спроси заново")
+    journal_path = batch_dir(name) / "journal.jsonl"
+    try:
+        entries = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+    except (OSError, ValueError):
+        entries = []
+    positive = any(
+        e.get("item") == item.get("id")
+        and e.get("decision") == "approve"
+        and (expected_link is None or e.get("approval_permalink") in (expected_link, None))
+        and e.get("via", "").startswith(("slack:", "telegram:"))
+        for e in entries
+    )
+    if not positive:
+        problems.append("в журнале batch нет положительного ответа владельца")
+    if problems:
+        print("slack-ask verify: ОТКАЗ — " + "; ".join(problems), file=sys.stderr)
+        return 1
+    shown_ref = expected_link or rnd.get("slack", {}).get("permalink") or name
+    print(f"slack-ask verify: ✅ владельца на {a.key} подтверждён ({shown_ref})")
+    return 0
+
+
 def verify(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="slack-ask verify",
                                  description="exit 0 — batch state/journal подтверждают ✅ владельца на вопрос про KEY; иначе 1")
@@ -419,6 +478,43 @@ def verify(argv: list[str]) -> int:
     ap.add_argument("--owner", default=os.environ.get("SLACK_ASK_OWNER", "U034A9RE6RF"))
     ap.add_argument("--require", action="append", default=[], help="слово, обязанное быть в вопросе (действие: jira)")
     a = ap.parse_args(argv)
+    ref = a.url.strip()
+    batch_candidate = ref[6:] if ref.startswith("batch:") else ref
+    if (batch_dir(batch_candidate) / "state.json").exists():
+        try:
+            state = load_batch(batch_candidate)
+        except (OSError, ValueError) as err:
+            print(f"slack-ask verify: {err}", file=sys.stderr)
+            return 1
+        if state.get("owner") != a.owner:
+            print(f"slack-ask verify: владелец пачки {batch_candidate} не совпадает с {a.owner}", file=sys.stderr)
+            return 1
+        candidates = [it for it in state.get("items", []) if it.get("id") == a.key] or list(state.get("items", []))
+        for item in candidates:
+            if item.get("rounds"):
+                rnd = item["rounds"][-1]
+                return _verify_item_round(batch_candidate, state, item, rnd, a,
+                                          expected_link=rnd.get("slack", {}).get("permalink"))
+        print(f"slack-ask verify: в пачке {batch_candidate} нет отправленных раундов", file=sys.stderr)
+        return 1
+    tg_match = re.match(r"^telegram:(-?\d+)/(\d+)$", ref)
+    if tg_match:
+        chat_s, card_id = tg_match.group(1), int(tg_match.group(2))
+        for name in list_batches():
+            try:
+                state = load_batch(name)
+            except (OSError, ValueError):
+                continue
+            if state.get("owner") != a.owner:
+                continue
+            for item in state.get("items", []):
+                for rnd in item.get("rounds", []):
+                    tg_info = rnd.get("telegram", {})
+                    chat_cards = (tg_info.get("chats") or {}).get(chat_s) or {}
+                    if tg_info.get("card_id") == card_id or chat_cards.get("card_id") == card_id:
+                        return _verify_item_round(name, state, item, rnd, a, expected_link=ref)
+        print(f"slack-ask verify: permalink {a.url} не найден в state/journal пачек", file=sys.stderr)
+        return 1
     try:
         ch, ts = parse_link(a.url)
     except ValueError as e:
@@ -436,40 +532,7 @@ def verify(argv: list[str]) -> int:
                 slack = rnd.get("slack", {})
                 if slack.get("ts") != ts or state.get("slack_channel") != ch:
                     continue
-                try:
-                    question = Path(rnd["snapshot"]).read_text(encoding="utf-8")
-                except OSError:
-                    question = ""
-                # the owner sees «*<id> · <title>*» above the payload — the key and the action live there too (2026-11-05)
-                title = item.get("title") or (item.get("labels") or {}).get("title", "")
-                question = f"{item.get('id', '')} · {title}\n{question}"
-                problems = []
-                # a ✅/❌ card without options is a yes/no question whether or not --yesno set the flag (2026-11-05:
-                # six approve_only «Jira <KEY>: Reopen» cards refused, the owner had to approve twice)
-                if item.get("options") or not (item.get("yesno") or item.get("approve_only")):
-                    problems.append("вопрос не помечен как --yesno")
-                if a.key not in question:
-                    problems.append(f"в вопросе нет ключа {a.key}")
-                for word in a.require:
-                    if word.lower() not in question.lower():
-                        problems.append(f"в вопросе нет слова «{word}»")
-                if time.time() - float(rnd.get("sent_epoch", 0)) > APPROVAL_MAX_AGE_S:
-                    problems.append("вопросу больше 24 ч — спроси заново")
-                journal_path = batch_dir(name) / "journal.jsonl"
-                try:
-                    entries = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
-                except (OSError, ValueError):
-                    entries = []
-                positive = any(e.get("item") == item.get("id") and e.get("decision") == "approve" and
-                               e.get("approval_permalink") == permalink(ch, ts) and
-                               e.get("via", "").startswith(("slack:", "telegram:")) for e in entries)
-                if not positive:
-                    problems.append("в журнале batch нет положительного ответа владельца")
-                if problems:
-                    print("slack-ask verify: ОТКАЗ — " + "; ".join(problems), file=sys.stderr)
-                    return 1
-                print(f"slack-ask verify: ✅ владельца на {a.key} подтверждён ({permalink(ch, ts)})")
-                return 0
+                return _verify_item_round(name, state, item, rnd, a, expected_link=permalink(ch, ts))
     print(f"slack-ask verify: permalink {a.url} не найден в state/journal пачек", file=sys.stderr)
     return 1
 
@@ -876,6 +939,24 @@ def tg_send(ctx: Ctx, **params) -> int:
     raise RuntimeError("unreachable")
 
 
+def tg_cosmetic(ctx: Ctx, method: str, **params):
+    """Best-effort Telegram edit/markup call with retries on transient network/429/5xx errors; ignores only benign
+    400s («message is not modified», «message to edit not found», «query is too old»)."""
+    if not ctx.tg:
+        return None
+    ao = _ask_owner()
+    sleep = getattr(ctx, "sleep", time.sleep)
+    for attempt in range(4):
+        try:
+            return ctx.tg(method, **params)
+        except (ao.TelegramError, OSError) as err:
+            if ao.transient(err) and attempt < 3:
+                sleep(min(8, 2 ** attempt))
+                continue
+            warn(f"{method} skipped: {err}")
+            return None
+
+
 # --- recipients: several people decide one batch in Telegram (the rules of ask_owner.record/resolve) ------------
 #
 # state["recipients"] exists only when more than one person decides: [owner, …]. A state without it (every batch
@@ -1093,7 +1174,8 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
         reply_ts = str(reply["ts"])
         s["seen"].append(reply_ts)
         s["copy_latest"] = reply_ts
-    if ctx.tg and "telegram" in state.get("initial_channels", ["slack", "telegram"]):
+    has_tg_round = bool(rnd["telegram"].get("card_id") or rnd["telegram"].get("chats"))
+    if ctx.tg and "telegram" in state.get("initial_channels", ["slack", "telegram"]) and not has_tg_round:
         t = rnd["telegram"]
         esc = html.escape
         multi = is_multi(state)
@@ -1193,20 +1275,118 @@ def notify(ctx: Ctx, state: dict, item: dict, text: str, telegram: bool = True) 
                 remember_message(state, item, person["chat_id"], sent.get("message_id"))
 
 
-def disarm(ctx: Ctx, item: dict) -> None:
-    """Remove the Telegram buttons of a closed item (cosmetic), in every recipient's chat."""
-    if not ctx.tg or not item["rounds"]:
+def _closed_summary(item: dict, summary: str | None = None) -> str:
+    if summary:
+        return summary
+    status = item.get("status", "")
+    lab = item.get("labels") or DEFAULT_LABELS
+    if status == "done":
+        if item.get("choice_label"):
+            return f"✔ Решено: {item['choice_label']}"
+        return f"✔ Принято: {lab.get('approve', 'ок')}"
+    if status == "rejected":
+        return f"✔ Отклонено: {lab.get('reject', 'не ок')}"
+    if status == "instructed":
+        return f"✔ По указанию: {item.get('result') or ''}".rstrip()
+    if status == "commented":
+        return "✍ Правки записаны"
+    if status == "correcting":
+        return "✍ Правки приняты — готовится новый раунд"
+    if status == "approving":
+        return f"✔ Принято: {lab.get('approve', 'ок')} — выполняется"
+    if status == "waiting_after":
+        return f"✔ Принято: {lab.get('approve', 'ок')} — ждёт зависимости"
+    if status == "expired":
+        return "⌛ Истекло — действие не запускается"
+    if status == "cancelled":
+        return f"✖ Снято: {item.get('cancel_reason') or CANCEL_REASON}"
+    return f"Статус: {STATUS_RU.get(status, status)}"
+
+
+def disarm(ctx: Ctx, item: dict, state: dict | None = None, summary: str | None = None) -> None:
+    """Close the item's cards across all channels: in Telegram, mark the card with the terminal outcome and remove its
+    inline keyboard across every round/extra card; in Slack, update the root message with the terminal outcome line."""
+    if not item.get("rounds"):
         return
-    for chat, ids in tg_cards(ctx, item["rounds"][-1]["telegram"]).items():
-        for card in [ids.get("card_id")] + list(ids.get("extra_ids") or []):
-            if card:
-                _ask_owner().cosmetic(ctx.tg, "editMessageReplyMarkup", chat_id=chat, message_id=card,
-                                      reply_markup={"inline_keyboard": []})
+    outcome_line = _closed_summary(item, summary)
+    title = (item.get("labels") or {}).get("title") or item.get("title") or ""
+    header = f"{item['id']} · {title}".strip(" ·")
+    if ctx.tg:
+        tg_text = f"<b>{html.escape(header)}</b>\n{html.escape(outcome_line)}"
+        for rnd in item["rounds"]:
+            for chat, ids in tg_cards(ctx, rnd.get("telegram", {})).items():
+                for card in [ids.get("card_id")] + list(ids.get("extra_ids") or []):
+                    if card:
+                        tg_cosmetic(ctx, "editMessageText", chat_id=chat, message_id=card,
+                                    text=tg_text, parse_mode="HTML", reply_markup={"inline_keyboard": []})
+                        tg_cosmetic(ctx, "editMessageReplyMarkup", chat_id=chat, message_id=card,
+                                    reply_markup={"inline_keyboard": []})
+    bot = getattr(ctx, "bot", None)
+    cur_slack = item["rounds"][-1].get("slack", {})
+    slack_ch = (state or {}).get("slack_channel") or cur_slack.get("text_channel")
+    if bot is not None and slack_ch and cur_slack.get("ts"):
+        closed_line = f"{header} · {outcome_line}"
+        blocks = [section(f"*{header}*\n{outcome_line}")]
+        if state and state.get("name"):
+            blocks.append({"type": "context", "elements": [
+                {"type": "mrkdwn", "text": f"🤖 {getattr(ctx, 'origin', '')} · slack-ask batch {state['name']}"}]})
+        try:
+            bot.chat_update(channel=slack_ch, ts=cur_slack["ts"], text=closed_line, blocks=blocks,
+                            unfurl_links=False, unfurl_media=False)
+        except Exception as err:
+            warn(f"{item['id']}: Slack card update skipped: {err}")
+
+
+def ensure_slack_mirror(ctx: Ctx, state: dict, item: dict) -> str | None:
+    """Ensure the current round has a verifiable permalink even when the owner answered in Telegram before
+    `telegram-first` escalation fired."""
+    if not item.get("rounds"):
+        return None
+    cur = item["rounds"][-1]
+    s = cur.setdefault("slack", {})
+    if s.get("permalink"):
+        return s["permalink"]
+    bot = getattr(ctx, "bot", None)
+    mode = (state.get("channels") or {}).get("mode", "slack-first")
+    if bot is not None and mode != "telegram-only":
+        try:
+            if not state.get("slack_channel"):
+                state["slack_channel"] = str(bot.conversations_open(users=ctx.owner)["channel"]["id"])
+            title = (item.get("labels") or {}).get("title") or item.get("title") or ""
+            line = f"{item['id']} · {title}".strip(" ·")
+            try:
+                body = Path(cur["snapshot"]).read_text(encoding="utf-8")
+            except OSError:
+                body = render_payload(item)
+            chunks = _send_blocks().chunk_markdown(body, BATCH_MD_LIMIT) if body.strip() else []
+            lab = item.get("labels") or DEFAULT_LABELS
+            options = item.get("options") or []
+            legend = ("  ".join([f"{NUM_EMOJI[i]} {opt}" for i, opt in enumerate(options)] + [f"❌ — {lab['reject']}"])
+                      if options else f"✅ — {lab['approve']}   ❌ — {lab['reject']}")
+            head = [f"*{line}*"] + ([item["detail"]] if item.get("detail") else []) + ["", legend]
+            if item.get("approve_only"):
+                head.append(approve_only_note(item))
+            blocks = [section("\n".join(head))] + chunks[:1] + [
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"🤖 {ctx.origin} · slack-ask batch {state['name']}"}]}]
+            first = bot.chat_postMessage(channel=state["slack_channel"], text=line, blocks=blocks,
+                                         unfurl_links=False, unfurl_media=False)
+            s["ts"] = str(first["ts"])
+            s["permalink"] = permalink(state["slack_channel"], s["ts"])
+            cur["secondary_sent"] = "telegram"
+            return s["permalink"]
+        except Exception as err:
+            warn(f"{item['id']}: Slack mirror on Telegram answer failed: {err}")
+    tg_info = cur.get("telegram") or {}
+    card_id = tg_info.get("card_id")
+    if card_id and getattr(ctx, "chat_id", None) is not None:
+        s["permalink"] = f"telegram:{ctx.chat_id}/{card_id}"
+        return s["permalink"]
+    return None
 
 
 def new_round(ctx: Ctx, state: dict, item: dict, text: str) -> None:
     previous = Path(item["rounds"][-1]["snapshot"]).read_text(encoding="utf-8")
-    disarm(ctx, item)
+    disarm(ctx, item, state, summary=f"↻ Заменён раундом {item['round'] + 1}")
     if item.get("answers"):  # a new text is a new question: answers to the old one do not carry over
         item["answers"] = {}
     item["round"] += 1
@@ -1262,6 +1442,8 @@ def decide(ctx: Ctx, state: dict, item: dict, action: str, via: str, text: str |
     if by:
         src = f" ({by})"
         item["by"] = by
+    if via.startswith("telegram:") and not cur["slack"].get("permalink"):
+        ensure_slack_mirror(ctx, state, item)
     approval = cur["slack"].get("permalink") or f"telegram:{ctx.chat_id}/{cur['telegram'].get('card_id')}"
     choice = int(action[1:]) if action.startswith("c") and action[1:].isdigit() else None
     choice_text = action == "choice_text"
@@ -1313,7 +1495,9 @@ def decide(ctx: Ctx, state: dict, item: dict, action: str, via: str, text: str |
             else:
                 notify(ctx, state, item, f"✔ Принято{src}: {lab['approve']} — согласовано; бот ничего не публикует, публикует агент")
             item["status"] = "done"
-            disarm(ctx, item)
+            if cur["slack"].get("permalink") and not isinstance(item.get("result"), dict):
+                item["result"] = {"permalink": cur["slack"]["permalink"]}
+            disarm(ctx, item, state)
             return "принято"
         dep = dependency(state, item)
         if dep is not None and not may_run_dependent(state, item):
@@ -1321,10 +1505,11 @@ def decide(ctx: Ctx, state: dict, item: dict, action: str, via: str, text: str |
             journal(state, item, "waiting_after", after=dep["id"])
             notify(ctx, state, item, f"✔ Принято{src}: {lab['approve']} — выполню после {dep['id']} "
                                      f"(сейчас: {STATUS_RU.get(dep['status'], dep['status'])})")
-            disarm(ctx, item)
+            disarm(ctx, item, state)
             return f"принято, жду {dep['id']}"
         notify(ctx, state, item, f"✔ Принято{src}: {lab['approve']}")
         start_hook(ctx, state, item, "on_approve")
+        disarm(ctx, item, state)
         return "принято, выполняю"
     if action == "r":
         instruction = next((note for note in reversed(state.get("to_agent") or [])
@@ -1335,21 +1520,24 @@ def decide(ctx: Ctx, state: dict, item: dict, action: str, via: str, text: str |
             item["result"] = instruction.get("text", "")
             journal(state, item, "instructed", via=via, text=item["result"])
             notify(ctx, state, item, f"✔ По указанию: {item['result']}")
-            disarm(ctx, item)
+            disarm(ctx, item, state)
             return "по указанию"
         item["status"] = "rejected"
         notify(ctx, state, item, f"✔ Решено: {verdict(item, 'r')} ({by})" +
                (f" · доводы: {comment}" if comment else "") if by else f"✔ Принято{src}: {lab['reject']}")
-        disarm(ctx, item)
+        disarm(ctx, item, state)
         if "on_reject" in item["hooks"]:
             start_hook(ctx, state, item, "on_reject")
         return "отклонено"
     if "on_corrections" not in item["hooks"]:
         item["status"] = "commented"
+        if text:
+            item["result"] = {"text": text, **({"permalink": cur["slack"]["permalink"]} if cur["slack"].get("permalink") else {})}
         notify(ctx, state, item, f"✍ правки записаны{src} (корректора у элемента нет)")
-        disarm(ctx, item)
+        disarm(ctx, item, state)
         return "записано"
     start_hook(ctx, state, item, "on_corrections", text=text or "")
+    disarm(ctx, item, state)
     notify(ctx, state, item, f"✍ Правки приняты{src} — корректор работает, потом пришлю раунд {item['round'] + 1}")
     return "правки приняты"
 
@@ -1600,8 +1788,8 @@ def set_keyboard(ctx: Ctx, item: dict, chat, buttons: list) -> int | None:
     """Replace the keyboard of the recipient's live card in HIS chat only (cosmetic: «not modified» is fine)."""
     card = latest_card(ctx, item, chat)
     if ctx.tg and card:
-        _ask_owner().cosmetic(ctx.tg, "editMessageReplyMarkup", chat_id=chat, message_id=card,
-                              reply_markup={"inline_keyboard": buttons})
+        tg_cosmetic(ctx, "editMessageReplyMarkup", chat_id=chat, message_id=card,
+                    reply_markup={"inline_keyboard": buttons})
     return card
 
 
@@ -1834,10 +2022,14 @@ def check_hooks(ctx: Ctx, state: dict) -> None:
                 # a hook that published but could not finish the record (ref/commit/push) says so in `warning`
                 tail = f"\n⚠ {result['warning']}" if result.get("warning") else ""
                 notify(ctx, state, item, (f"{lab['done']}: {link}" if link else f"✔ {lab['done']}") + tail)
-                disarm(ctx, item)
+                disarm(ctx, item, state)
             else:
                 item["status"] = "approve_failed"
                 journal(state, item, "approve_failed", exit=code, log=log)
+                if ctx.tg and item.get("rounds"):
+                    buttons, _ = item_buttons(state, item)
+                    for person in recipients_of(ctx, state):
+                        set_keyboard(ctx, item, person["chat_id"], buttons)
                 notify(ctx, state, item, f"⚠ действие после ✅ не выполнено (exit {code}), лог {log}. "
                                          "Повтор — 👍 в Slack или ✅ в Telegram")
         elif kind == "on_corrections":
@@ -1856,6 +2048,10 @@ def check_hooks(ctx: Ctx, state: dict) -> None:
             else:
                 item["status"] = "pending"
                 journal(state, item, "corrector_no_change", exit=code, log=log)
+                if ctx.tg and item.get("rounds"):
+                    buttons, _ = item_buttons(state, item)
+                    for person in recipients_of(ctx, state):
+                        set_keyboard(ctx, item, person["chat_id"], buttons)
                 notify(ctx, state, item, f"⚠ корректор закончил (exit {code}), текст не изменился — жду ответа на "
                                          f"раунд {item['round']}. Лог: {log}")
         else:
@@ -1916,7 +2112,7 @@ def expire_items(ctx: Ctx, state: dict) -> None:
         close_item_prompts(ctx, state, item, "истекло")
         journal(state, item, "expired", via="timeout")
         notify(ctx, state, item, "⌛ истекло — действие не запускается")
-        disarm(ctx, item)
+        disarm(ctx, item, state)
         if "on_timeout" in item["hooks"]:
             start_hook(ctx, state, item, "on_timeout")
 
@@ -2009,14 +2205,62 @@ def switch_to_bot_thread(ctx: Ctx, state: dict) -> None:
         journal(state, item, "slack_text_fallback", via="auth", mode="bot-thread")
 
 
+def ensure_owner_client(ctx: Ctx, states: dict[str, dict]) -> None:
+    """If a previous batch lost `ctx.usr` on an expired token and `.env` was refreshed later (or a new batch with
+    `copy_ts` arrived), try reloading `ctx.usr` once for the new batch so the owner's replies in copy threads are read
+    instead of silently switching the new batch to bot-thread."""
+    if ctx.usr is not None or not getattr(ctx, "reload_owner_client", None):
+        return
+    checked = getattr(ctx, "owner_auth_checked_batches", None)
+    if checked is None:
+        checked = set()
+        ctx.owner_auth_checked_batches = checked
+    candidates = [
+        name for name, state in states.items()
+        if name not in checked
+        and (state.get("slack_text") == "copy" or state.get("slack_text_reason") == FALLBACK_REASON)
+        and any(i["status"] in OPEN + ("correcting",) and i.get("rounds") and i["rounds"][-1]["slack"].get("copy_ts")
+                for i in state.get("items", []))
+    ]
+    if not candidates:
+        return
+    checked.update(candidates)
+    try:
+        fresh = ctx.reload_owner_client()
+        if fresh is None:
+            return
+        if not isinstance(fresh, OwnerDMClient):
+            fresh = OwnerDMClient(fresh, ctx.owner)
+        fresh.auth_test()
+        fresh.conversations_open(users=ctx.owner)
+        ctx.usr = fresh
+        ctx.owner_auth_failed = False
+        for name in candidates:
+            state = states[name]
+            if state.get("slack_text_reason") == FALLBACK_REASON and any(
+                i.get("rounds") and i["rounds"][-1]["slack"].get("copy_ts") for i in state.get("items", [])
+            ):
+                state["slack_text"] = "copy"
+                state["slack_text_reason"] = None
+                state.pop("owner_auth_failed", None)
+    except Exception:
+        return
+
+
 def _fallback_owner_text(ctx: Ctx, states: dict[str, dict]) -> None:
     if not ctx.owner_auth_failed:
         return
     ctx.owner_auth_failed = False
     ctx.usr = None
-    for state in states.values():
+    checked = getattr(ctx, "owner_auth_checked_batches", None)
+    if checked is None:
+        checked = set()
+        ctx.owner_auth_checked_batches = checked
+    for name, state in states.items():
+        checked.add(name)
         if state.get("slack_text") != "copy":
             continue
+        state["owner_auth_failed"] = True
         switch_to_bot_thread(ctx, state)
     if not ctx.owner_auth_transition_logged:
         ctx.owner_auth_transition_logged = True
@@ -2057,33 +2301,42 @@ def poll_slack(ctx: Ctx, state: dict, cache: dict | None = None) -> None:
                 reaction_action = (f"c{got[0]}" if got[0].isdigit() else "a" if got[0] == "ok" else "r")
                 decide(ctx, state, item, reaction_action, f"slack:reaction:{got[1]}")
     mode = state.get("slack_text", "copy")
-    client = ctx.usr if mode == "copy" else ctx.bot
-    channel = state.get("copy_channel") if mode == "copy" else state.get("slack_channel")
-    if mode == "off" or client is None or not channel:
+    if mode == "off":
         return
-    with_copy = [i for i in live if i["rounds"][-1]["slack"].get("copy_ts" if mode == "copy" else "text_ts")]
-    if not with_copy:
-        return
-    key = "copy_ts" if mode == "copy" else "text_ts"
-    msgs = (cache or {}).get((id(client), channel)) or _history(
-        client, channel, min(i["rounds"][-1]["slack"][key] for i in with_copy))
-    for item in with_copy:
-        s = item["rounds"][-1]["slack"]
-        thread_ts = s[key]
-        m = msgs.get(thread_ts)
-        if not m or not m.get("latest_reply") or m["latest_reply"] == s.get("copy_latest"):
+    sources: list[tuple[object, str | None, str]] = []
+    if mode == "copy":
+        sources.append((ctx.usr, state.get("copy_channel"), "copy_ts"))
+    else:
+        sources.append((ctx.bot, state.get("slack_channel"), "text_ts"))
+        if ctx.usr is not None and state.get("copy_channel"):
+            sources.append((ctx.usr, state.get("copy_channel"), "copy_ts"))
+    for client, channel, key in sources:
+        if client is None or not channel:
             continue
-        replies = client.conversations_replies(channel=channel, ts=thread_ts, limit=200).get("messages", [])
-        new = [r for r in replies if r.get("ts") != s.get("copy_ts", thread_ts) and r.get("ts") not in s["seen"]]
-        s["seen"] += [str(r.get("ts")) for r in new]
-        s["copy_latest"] = m["latest_reply"]
-        text = "\n\n".join(html.unescape(r.get("text", "")) for r in new if r.get("user") == ctx.owner)
-        if text.strip():
-            decide(ctx, state, item, "e", "slack:thread", text)
+        with_copy = [i for i in live if i["rounds"][-1]["slack"].get(key)]
+        if not with_copy:
+            continue
+        msgs = (cache or {}).get((id(client), channel)) or _history(
+            client, channel, min(i["rounds"][-1]["slack"][key] for i in with_copy))
+        for item in with_copy:
+            s = item["rounds"][-1]["slack"]
+            thread_ts = s[key]
+            m = msgs.get(thread_ts)
+            latest_key = "copy_latest" if key == "copy_ts" else "text_latest"
+            if not m or not m.get("latest_reply") or m["latest_reply"] == s.get(latest_key):
+                continue
+            replies = client.conversations_replies(channel=channel, ts=thread_ts, limit=200).get("messages", [])
+            new = [r for r in replies if r.get("ts") != thread_ts and r.get("ts") not in s["seen"]]
+            s["seen"] += [str(r.get("ts")) for r in new]
+            s[latest_key] = m["latest_reply"]
+            text = "\n\n".join(html.unescape(r.get("text", "")) for r in new if r.get("user") == ctx.owner)
+            if text.strip():
+                decide(ctx, state, item, "e", "slack:thread", text)
 
 
 def slack_groups(ctx: Ctx, states: dict[str, dict]) -> dict:
     """{(id(client), channel): (client, [timestamps], [batch names])} — one history call per channel for every batch."""
+    ensure_owner_client(ctx, states)
     groups: dict[tuple[int, str], tuple[object, list[str], list[str]]] = {}
     for name, state in states.items():
         opened = [i for i in state["items"] if i["status"] in OPEN and i["rounds"]]
@@ -2102,6 +2355,13 @@ def slack_groups(ctx: Ctx, states: dict[str, dict]) -> dict:
             if ts:
                 groups.setdefault(key, (client, [], []))[1].extend(ts)
                 groups[key][2].append(name)
+        if mode != "copy" and ctx.usr is not None and state.get("copy_channel"):
+            copy_ts = [i["rounds"][-1]["slack"]["copy_ts"] for i in state["items"]
+                       if i["status"] in OPEN + ("correcting",) and i["rounds"] and i["rounds"][-1]["slack"].get("copy_ts")]
+            if copy_ts:
+                ckey = (id(ctx.usr), state["copy_channel"])
+                groups.setdefault(ckey, (ctx.usr, [], []))[1].extend(copy_ts)
+                groups[ckey][2].append(name)
     return {k: v for k, v in groups.items() if v[1]}
 
 
@@ -2901,9 +3161,11 @@ def batch_watch(ctx: Ctx, names: list[str] | None = None, timeout: int = 0, slac
                 ao.claim_consumer({"what": "slack-ask batch watch", "host": socket.gethostname()})
             loaded = {n: load_batch(n) for n in (names or list_batches())}
             refresh_status(ctx, gstate, loaded)
+            ensure_owner_client(ctx, loaded)
             if ctx.usr is None:
                 for state in loaded.values():
                     if state.get("slack_text") == "copy" and any(i["status"] in OPEN for i in state["items"]):
+                        state["owner_auth_failed"] = True
                         switch_to_bot_thread(ctx, state)
                         save_batch(state)
             pending_arguments = {str(v[0]) for field in ("argument_prompts", "reason_prompts", "agent_prompts")
@@ -3217,7 +3479,8 @@ def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
         if not items or problems:
             raise ValueError("spec not ready, nothing sent: " + ("; ".join(problems) or "no items"))
         d.mkdir(parents=True, exist_ok=True)
-        items = [default_corrector(d, n, it) for n, it in enumerate(items, 1)]
+        items = [default_corrector(d, n, it, spec_approve_only=bool(spec.get("approve_only")))
+                 for n, it in enumerate(items, 1)]
         judge_mode = "agent" if os.environ.get("SLACK_ASK_JUDGE") == "agent" else spec.get("judge", "model")
         if judge_mode not in ("model", "agent"):
             raise ValueError("judge must be 'model' or 'agent'")
@@ -3240,7 +3503,7 @@ def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
                       "notify_only": bool(it.get("notify_only")),
                       "hooks": {h: it[h] for h in HOOKS if it.get(h)}, "vars": it.get("vars", {}),
                       "after": it.get("after"), "approve_only": bool(it.get("approve_only", spec.get("approve_only"))),
-                      "timeout": it.get("timeout", spec.get("timeout")),
+                      "timeout": it.get("timeout", spec.get("timeout", DEFAULT_TIMEOUT_S)),
                       "status": "new", "round": 0, "sha256": None, "rounds": [], "hook": None, "queued": [],
                       "result": None, "last": None} for n, it in enumerate(items, 1)]}
         if people:
@@ -3291,11 +3554,14 @@ def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
     return state
 
 
-def default_corrector(d: Path, n: int, it: dict) -> dict:
+def default_corrector(d: Path, n: int, it: dict, spec_approve_only: bool = False) -> dict:
     """The item as sent: without on_corrections it gets DEFAULT_CORRECTOR, which rewrites the payload file in place
-    (an inline payload is written to <batch>/payloads/ first). The corrected file is the next round."""
+    (an inline payload is written to <batch>/payloads/ first). The corrected file is the next round.
+    Pure yes/no approve_only questions without an explicit corrector record the owner's text reply as `commented`."""
     if it.get("on_corrections"):
         return it
+    if it.get("yesno") and bool(it.get("approve_only", spec_approve_only)) and not it.get("on_approve"):
+        return dict(it)
     it = dict(it)
     if not it.get("payload_file"):
         (d / "payloads").mkdir(parents=True, exist_ok=True)
@@ -3337,7 +3603,7 @@ def batch_cancel(state: dict, ids: list[str] | None, reason: str = CANCEL_REASON
         done.append(item)
         if not tg or not item["rounds"]:
             continue
-        disarm(ctx, item)
+        disarm(ctx, item, state, summary=f"✖ Снято: {reason}")
         for person in recipients_of(ctx, state):
             card = latest_card(ctx, item, person["chat_id"])
             reply = {"reply_to_message_id": card, "allow_sending_without_reply": True} if card else {}
@@ -3387,7 +3653,7 @@ def batch_resolve(state: dict, item_id: str, same: str | None = None, dispute: b
         item["status"], item["result"] = "instructed", wording
         journal(state, item, "instructed", via="cli", text=wording)
         ctx = tg_only_ctx(tg, chat_id)
-        disarm(ctx, item)
+        disarm(ctx, item, state, summary=f"✔ По указанию: {wording}")
         if tg and item["rounds"]:
             for person in recipients_of(ctx, state):
                 card = latest_card(ctx, item, person["chat_id"])
@@ -3485,6 +3751,10 @@ def batch_wait(name: str, ids: list[str] | None, timeout: int, poll: float, cloc
         if not chosen:
             print(f"slack-ask batch wait: no item {ids} in batch {name}", file=sys.stderr)
             return 2
+        if state.get("owner_auth_failed") and any(i["status"] in OPEN for i in chosen):
+            print(f"slack-ask batch wait: пользовательский Slack-токен отклонён в пачке {name}; чтение треда копии невозможно",
+                  file=sys.stderr)
+            return 7
         review = [i for i in chosen if i["status"] == "review"]
         if review:  # own texts differ in letter: the agent compares the meaning — every wait until resolved
             for i in review:
@@ -3504,7 +3774,9 @@ def batch_wait(name: str, ids: list[str] | None, timeout: int, poll: float, cloc
                 judge = i.get("judge") or {}
                 judged = (" · сверено моделью: " + one_line(judge.get("rationale", ""), 180)
                           if judge.get("source") == "model" and judge.get("rationale") else "")
-                detail = f"по указанию: {i.get('result')}" if i["status"] == "instructed" else (res.get("permalink") or "")
+                detail = (f"по указанию: {i.get('result')}" if i["status"] == "instructed"
+                          else f"комментарий: {res.get('text')}" if i["status"] == "commented" and res.get("text")
+                          else (res.get("permalink") or ""))
                 arguments = i.get("answers") or {}
                 picks = "; ".join(f"{a.get('by')}: {answer_label(i, a)}; довод: {a.get('argument') or 'без довода'}"
                                    for a in arguments.values())
@@ -3623,7 +3895,7 @@ def batch_cli(argv: list[str]) -> int:
     wt = sub.add_parser("wait", help="block until the owner decided the items (run in background after send)")
     wt.add_argument("--batch", required=True)
     wt.add_argument("--item", action="append", help="item id (default: every item)")
-    wt.add_argument("--timeout", type=int, default=6900, help="seconds; 0 = no limit; exit 3 on timeout")
+    wt.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_S, help="seconds; 0 = no limit; exit 3 on timeout")
     wt.add_argument("--poll", type=float, default=15)
     c = sub.add_parser("cancel", help="take items off the wait and off the phones: buttons removed for every recipient, reason said (state is merged under lock — a running watch may stay)")
     c.add_argument("--batch", required=True)
