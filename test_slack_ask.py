@@ -353,3 +353,27 @@ def test_defect4_telegram_first_button_answer_has_verifiable_permalink_and_verif
     capsys.readouterr()
     [batch_name] = sa.list_batches()
     assert sa.verify([batch_name, "--key", "PLAT-4888", "--owner", OWNER, "--require", "Jira"]) == 0
+
+
+def test_copy_thread_reply_written_before_escalation_is_not_swallowed_by_the_round_notice(env):
+    """2026-11-18 TASK-1319: the owner answered in the copy thread 72 s after a slack-first card; the 60 s escalation
+    re-sent the round, posted «раунд 1 готов» into the copy thread from the owner's token and set copy_latest to that
+    notice, so the poll that followed in the same cycle saw latest_reply == copy_latest and never read the answer."""
+    c = env.ctx()
+    st = sa.batch_send(c, {
+        "title": "TASK-1319 · касса",
+        "channels": {"mode": "slack-first", "escalate_after": 60},
+        "approve_only": True,
+        "items": [{"id": "TASK-1319", "title": "Как закрываем TC-358?", "payload": "Текст",
+                   "options": ["принять по unit", "попросить Qatar"]}],
+    }, "b-esc-race")
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    sa.poll_slack_batches(c, {"b-esc-race": st})  # a poll before the answer: nothing new
+    reply = "перебирай рекурсивно ищи подходящее уверен что нет подходящих касс в контурах тест6 и тест3?"
+    env.ws.post(OWNER, "DSELF", reply, thread_ts=copy_ts)
+    env.clock.now += 61
+    sa.send_escalations(c, st)  # same cycle order as batch_watch: escalation, then the Slack poll
+    sa.poll_slack_batches(c, {"b-esc-race": st})
+    item = st["items"][0]
+    texts = json.dumps(st.get("to_agent", []), ensure_ascii=False) + json.dumps(item, ensure_ascii=False)
+    assert reply in texts, "the owner's copy-thread answer was swallowed by the escalation notice"

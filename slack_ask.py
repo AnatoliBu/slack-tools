@@ -1171,9 +1171,9 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
         notice = f"{line} · раунд {r} готов: {preview}\n{text}"
         reply = ctx.usr.chat_postMessage(channel=state["copy_channel"], thread_ts=s["copy_ts"], text=notice,
                                          unfurl_links=False)
-        reply_ts = str(reply["ts"])
-        s["seen"].append(reply_ts)
-        s["copy_latest"] = reply_ts
+        # seen only: copy_latest stays where the last poll left it, otherwise an owner reply written before this
+        # notice (2026-11-18 TASK-1319: 9 s before the 60 s escalation) is never read
+        s["seen"].append(str(reply["ts"]))
     has_tg_round = bool(rnd["telegram"].get("card_id") or rnd["telegram"].get("chats"))
     if ctx.tg and "telegram" in state.get("initial_channels", ["slack", "telegram"]) and not has_tg_round:
         t = rnd["telegram"]
