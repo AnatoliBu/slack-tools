@@ -589,3 +589,185 @@ def test_edit_shrinking_long_payload_marks_old_continuations_replaced_without_ne
     assert "коротко" in edited[tg_body[0]] and all("заменена" in edited[mid] for mid in tg_body[1:])
     item = sa.load_batch("b-long")["items"][0]
     assert item["rounds"][0]["slack"]["body_parts"] == [] and item["rounds"][0]["telegram"]["body_ids"] == tg_body[:1]
+
+
+# --- batch edit: branches the first tests did not pin (acceptance r1) ---------------------------------------------
+
+def _reactions_remove(self, channel: str, timestamp: str, name: str) -> None:
+    msg = self.ws.find(channel, timestamp)
+    msg["reactions"] = [r for r in msg["reactions"] if r["name"] != name]
+
+
+def _bot_presets(env, ts) -> set[str]:
+    return {r["name"] for r in env.ws.find("DBOT", ts)["reactions"] if BOT in r["users"]}
+
+
+def test_edit_options_change_keeps_preset_reactions_in_step_with_new_options(env, monkeypatch):
+    monkeypatch.setattr(FakeClient, "reactions_remove", _reactions_remove, raising=False)
+    c, _key, ts, _card = _sent_for_edit(env)
+    assert _bot_presets(env, ts) == {"one", "two", "x"}
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"options": ["A", "B", "C", "D"]})
+    assert _bot_presets(env, ts) == {"one", "two", "three", "four", "x"}
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"options": ["A", "B"]})
+    assert _bot_presets(env, ts) == {"one", "two", "x"}
+
+
+def test_edit_is_not_a_decision_last_status_and_show_stay(env):
+    c, _key, _ts, _card = _sent_for_edit(env)
+    before = sa.load_batch("b-edit")["items"][0]
+    assert before["last"]["decision"] == "sent"
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"detail": "новая деталь"})
+    st = sa.load_batch("b-edit")
+    assert st["items"][0]["last"] == before["last"] and st["items"][0]["status"] == "pending"
+    assert "sent" in sa.batch_show(st) and "edited" not in sa.batch_show(st)
+    journal = [json.loads(ln) for ln in (sa.batch_dir("b-edit") / "journal.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert journal[-1]["decision"] == "edited" and journal[-1]["revision"] == 1
+
+
+def test_edit_slack_failure_is_exit_1_pending_redraw_and_repeat_finishes(env, monkeypatch, capsys):
+    c, _key, ts, _card = _sent_for_edit(env)
+    monkeypatch.setattr(sa, "make_ctx", lambda args, telegram=True: c)
+    real = Workspace.update
+
+    def broken(self, *a, **k):
+        raise FakeSlackError("ratelimited", 429)
+
+    monkeypatch.setattr(Workspace, "update", broken)
+    argv = ["edit", "--batch", "b-edit", "--item", "TASK-201", "--detail", "новая деталь"]
+    assert sa.batch_cli(argv) == 1
+    err = capsys.readouterr().err
+    assert "repeat the same edit" in err
+    st = sa.load_batch("b-edit")
+    assert st["items"][0]["redraw_pending"] is True and st["items"][0]["detail"] == "новая деталь"
+    assert "перерисовка не завершена" in sa.batch_show(st)
+    monkeypatch.setattr(Workspace, "update", real)
+    assert sa.batch_cli(argv) == 0  # the same edit: values equal, but the pending redraw lets it through
+    st = sa.load_batch("b-edit")
+    assert "redraw_pending" not in st["items"][0]
+    assert "перерисовка не завершена" not in sa.batch_show(st)
+    assert "новая деталь" in json.dumps(env.ws.find("DBOT", ts)["blocks"], ensure_ascii=False)
+
+
+def test_edit_telegram_failure_is_reported_and_keeps_redraw_pending(env):
+    c, _key, _ts, _card = _sent_for_edit(env)
+    real = env.tg.__class__.__call__
+
+    def failing(self, method, **params):
+        if method == "sendMessage":
+            raise RuntimeError("telegram down")
+        return real(self, method, **params)
+
+    env.tg.__class__.__call__ = failing
+    try:
+        with pytest.raises(RuntimeError, match="Telegram"):
+            sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"detail": "новая деталь"})
+    finally:
+        env.tg.__class__.__call__ = real
+    assert sa.load_batch("b-edit")["items"][0]["redraw_pending"] is True
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"detail": "новая деталь"})
+    assert "redraw_pending" not in sa.load_batch("b-edit")["items"][0]
+
+
+def _multi_sent(env):
+    c = env.ctx()
+    spec = {"title": "m", "channels": "telegram-only", "approve_only": True,
+            "recipients": [{"chat_id": 777, "name": "Вася"}],
+            "items": [{"id": "TASK-301", "title": "выбор", "detail": "деталь", "payload": "Текст", "options": ["A", "B"]}]}
+    st = sa.batch_send(c, spec, "b-multi")
+    return c, st["key"], st["items"][0]["rounds"][0]["telegram"]["chats"]
+
+
+def test_edit_multi_recipient_answered_keeps_answered_keyboard_and_options_change_is_refused(env):
+    c, key, chats = _multi_sent(env)
+    assert set(chats) == {str(TG_OWNER), "777"}
+    env.tg.tap(f"sa|{key}|1|1|c1", user=777)
+    sa.batch_watch(c, names=["b-multi"], timeout=10, slack_poll=0, tg_poll=5)
+    item = sa.load_batch("b-multi")["items"][0]
+    assert item["status"] == "pending" and "777" in item["answers"]
+    calls0 = len(env.tg.calls)
+    with pytest.raises(ValueError, match="кто-то из получателей уже ответил"):
+        sa.batch_edit(c, sa.load_batch("b-multi"), "TASK-301", {"options": ["X", "Y"]})
+    assert len(env.tg.calls) == calls0
+    sa.batch_edit(c, sa.load_batch("b-multi"), "TASK-301", {"detail": "новая деталь"})
+    edits = {p["chat_id"]: p for m, p in env.tg.calls[calls0:] if m == "editMessageText"}
+    assert set(edits) == {TG_OWNER, 777}
+    texts = lambda p: [b["text"] for row in p["reply_markup"]["inline_keyboard"] for b in row]  # noqa: E731
+    assert sa.CHANGE_ANSWER in texts(edits[777]) and not any("A" in t for t in texts(edits[777]))
+    assert any("A" in t for t in texts(edits[TG_OWNER]))
+    # the «✏️» notice: a reply to each recipient's own card, remembered for reply-binding
+    sends = [p for m, p in env.tg.calls[calls0:] if m == "sendMessage"]
+    assert {p["chat_id"]: p["reply_to_message_id"] for p in sends} == \
+        {int(c_): ids["card_id"] for c_, ids in chats.items()}
+    after = sa.load_batch("b-multi")["items"][0]["rounds"][-1]["telegram"]["chats"]
+    for c_, ids in after.items():
+        assert any(p["chat_id"] == int(c_) for p in sends) and len(ids["notice_ids"]) >= 1
+
+
+def test_edit_telegram_notice_is_remembered_as_notice_of_the_card(env):
+    c, _key, _ts, card = _sent_for_edit(env)
+    calls0 = len(env.tg.calls)
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"detail": "новая деталь"})
+    [send] = [p for m, p in env.tg.calls[calls0:] if m == "sendMessage"]
+    assert send["reply_to_message_id"] == card and send["text"].startswith("TASK-201 · ✏️ карточка обновлена")
+    notice_ids = sa.load_batch("b-edit")["items"][0]["rounds"][-1]["telegram"]["notice_ids"]
+    assert len(notice_ids) == 1
+
+
+def _long_sent(env, name="b-legacy"):
+    c = env.ctx()
+    spec = json.loads(json.dumps(EDIT_SPEC))
+    spec["items"][0]["payload"] = "длинная строка текста\n" * 600
+    return c, sa.batch_send(c, spec, name)
+
+
+def _strip_body_markers(name, round_=None):
+    st = sa.load_batch(name)
+    item = st["items"][0]
+    rnd = item["rounds"][-1]
+    for key in ("body_parts", "body_start"):
+        rnd["slack"].pop(key, None)
+    rnd["telegram"].pop("body_ids", None)
+    if round_:
+        item["round"] = round_
+    sa.save_batch(st)
+
+
+def test_edit_legacy_state_round_1_rewrites_every_text_part(env):
+    c, st = _long_sent(env)
+    slack = st["items"][0]["rounds"][0]["slack"]
+    parts, tg_parts_ = list(slack["body_parts"]), list(st["items"][0]["rounds"][0]["telegram"]["body_ids"])
+    _strip_body_markers("b-legacy")
+    calls0 = len(env.tg.calls)
+    sa.batch_edit(c, sa.load_batch("b-legacy"), "TASK-201", {"payload": "коротко"})
+    for ts in parts:
+        assert "заменена" in env.ws.find("DBOT", ts)["text"]
+    edited = {p["message_id"]: p["text"] for m, p in env.tg.calls[calls0:] if m == "editMessageText"}
+    assert "коротко" in edited[tg_parts_[0]] and all("заменена" in edited[mid] for mid in tg_parts_[1:])
+
+
+def test_edit_legacy_state_later_round_redraws_only_the_card(env):
+    c, st = _long_sent(env, "b-legacy2")
+    slack = st["items"][0]["rounds"][0]["slack"]
+    parts, tg_body = list(slack["body_parts"]), list(st["items"][0]["rounds"][0]["telegram"]["body_ids"])
+    ts, card = slack["ts"], st["items"][0]["rounds"][0]["telegram"]["card_id"]
+    _strip_body_markers("b-legacy2", round_=2)
+    posts0, calls0, updates0 = sum(len(v) for v in env.ws.messages.values()), len(env.tg.calls), len(env.ws.chat_updates)
+    sa.batch_edit(c, sa.load_batch("b-legacy2"), "TASK-201", {"payload": "коротко"})
+    assert [u[1] for u in env.ws.chat_updates[updates0:]].count(ts) == 1
+    assert not any(u[1] in parts for u in env.ws.chat_updates[updates0:])
+    assert sum(len(v) for v in env.ws.messages.values()) == posts0 + 1  # only the «✏️» line
+    edited = [p["message_id"] for m, p in env.tg.calls[calls0:] if m == "editMessageText"]
+    assert edited == [card] and not set(edited) & set(tg_body)
+
+
+def test_edit_retry_after_failed_redraw_rewrites_the_text_parts_too(env, monkeypatch):
+    c, st = _long_sent(env, "b-retry")
+    parts = list(st["items"][0]["rounds"][0]["slack"]["body_parts"])
+    real = Workspace.update
+    monkeypatch.setattr(Workspace, "update", lambda self, *a, **k: (_ for _ in ()).throw(FakeSlackError("ratelimited", 429)))
+    with pytest.raises(RuntimeError, match="Slack"):
+        sa.batch_edit(c, sa.load_batch("b-retry"), "TASK-201", {"payload": "коротко"})
+    assert all("заменена" not in env.ws.find("DBOT", ts)["text"] for ts in parts)
+    monkeypatch.setattr(Workspace, "update", real)
+    sa.batch_edit(c, sa.load_batch("b-retry"), "TASK-201", {"payload": "коротко"})
+    assert all("заменена" in env.ws.find("DBOT", ts)["text"] for ts in parts)
