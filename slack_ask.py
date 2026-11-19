@@ -2330,8 +2330,15 @@ def poll_slack(ctx: Ctx, state: dict, cache: dict | None = None) -> None:
             s["seen"] += [str(r.get("ts")) for r in new]
             s[latest_key] = m["latest_reply"]
             text = "\n\n".join(html.unescape(r.get("text", "")) for r in new if r.get("user") == ctx.owner)
-            if text.strip():
-                decide(ctx, state, item, "e", "slack:thread", text)
+            if not text.strip():
+                continue
+            if item["status"] in OPEN and item.get("options") and item.get("options_text") != "corrections" \
+                    and ends_with_question(text.strip()) and not text_choice(text, len(item["options"])):
+                # a question to the agent, not an own option (2026-11-19 rtr-b1g1: choice=0, label = the question)
+                to_agent(ctx, state, item, text, "slack:thread-question", chat=ctx.chat_id,
+                         response="Передал агенту как вопрос")
+                continue
+            decide(ctx, state, item, "e", "slack:thread", text)
 
 
 def slack_groups(ctx: Ctx, states: dict[str, dict]) -> dict:
@@ -3120,6 +3127,13 @@ def slack_round(ctx: Ctx, run) -> None:
         warn(f"slack poll: {err!r}")
 
 
+def slack_cadence(age: float, slack_poll: int) -> int:
+    """Seconds between Slack rounds for a card `age` s old. One history call per channel per round is far below the
+    rate limit, so it never goes slower than a minute: an owner answers an hour-old card as readily as a fresh one
+    (2026-11-19 rtr-b1g1: a 600 s cadence delayed a copy-thread answer by minutes)."""
+    return 0 if slack_poll == 0 else (20 if age < 600 else 60)
+
+
 def start_slack_fetch(ctx: Ctx, states: dict[str, dict]) -> dict:
     """Plan the round now (main loop), fetch in a daemon thread; the result is applied by the main loop."""
     import threading
@@ -3246,7 +3260,7 @@ def batch_watch(ctx: Ctx, names: list[str] | None = None, timeout: int = 0, slac
             else:
                 waiting = [i for s in states.values() for i in s["items"] if i["status"] in OPEN and i["rounds"]]
                 age = ctx.clock() - max((i["rounds"][-1].get("sent_epoch", ctx.clock()) for i in waiting), default=ctx.clock())
-                cadence = 0 if slack_poll == 0 else (20 if age < 600 else 120 if age < 3600 else 600)
+                cadence = slack_cadence(age, slack_poll)
                 due = ctx.clock() - last_slack >= cadence
             if fetching is not None and not fetching["thread"].is_alive():
                 done, fetching = fetching, None

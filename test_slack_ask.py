@@ -377,3 +377,68 @@ def test_copy_thread_reply_written_before_escalation_is_not_swallowed_by_the_rou
     item = st["items"][0]
     texts = json.dumps(st.get("to_agent", []), ensure_ascii=False) + json.dumps(item, ensure_ascii=False)
     assert reply in texts, "the owner's copy-thread answer was swallowed by the escalation notice"
+
+
+QUESTION = "Причем тут пересинк на проде? Какой вердикт на тесте e2e? Синк ломается если меню не снести или что?"
+
+
+def _incident_spec(batch_id_title="RTR-B1G1"):
+    return {
+        "title": "B1G1 — что дальше",
+        "channels": {"mode": "slack-first", "escalate_after": 0},
+        "approve_only": True,
+        "items": [{"id": batch_id_title, "title": "Переводим в RTR?", "payload": "Текст",
+                   "options": ["🚀 RTR всем трём", "🚀 RTR только 3480 + 3384", "⏸ Пока не переводить"]}],
+    }
+
+
+def test_copy_thread_reply_is_read_without_intermediate_agent_reply(env):
+    """2026-11-19 rtr-b1g1: send → poll → owner writes in the copy thread → poll must see it (no `batch reply` between)."""
+    c = env.ctx()
+    st = sa.batch_send(c, _incident_spec(), "b-copy-direct")
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    sa.poll_slack_batches(c, {"b-copy-direct": st})
+    env.ws.post(OWNER, "DSELF", "Почему не третий вариант?!", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"b-copy-direct": st})
+    assert "Почему не третий вариант?!" in json.dumps(st["items"][0], ensure_ascii=False) + json.dumps(st.get("to_agent", []), ensure_ascii=False)
+    assert st["items"][0]["rounds"][-1]["slack"]["copy_latest"]
+
+
+def test_question_in_copy_thread_is_not_a_choice(env):
+    """2026-11-19 rtr-b1g1: a question to the agent written in the copy thread was recorded as choice=0 with the
+    question as choice_label and closed the item; it must go to the agent and leave the item open."""
+    c = env.ctx()
+    st = sa.batch_send(c, _incident_spec(), "b-copy-question")
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", QUESTION, thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"b-copy-question": st})
+    item = st["items"][0]
+    assert item["status"] in sa.OPEN, item["status"]
+    assert item.get("choice") is None and not item.get("choice_label")
+    assert [n["text"] for n in st["to_agent"]] == [QUESTION]
+    assert st["to_agent"][0]["via"] == "slack:thread-question"
+
+
+def test_free_text_without_question_in_copy_thread_is_still_own_option(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _incident_spec(), "b-copy-own")
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "Переводим только после проверки на проде", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"b-copy-own": st})
+    assert st["items"][0]["choice"] == 0
+
+
+def test_question_with_option_number_in_copy_thread_is_still_a_choice(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _incident_spec(), "b-copy-num")
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "2, ок?", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"b-copy-num": st})
+    assert st["items"][0]["choice"] == 2
+
+
+@pytest.mark.parametrize("age", [0, 599, 600, 3599, 3600, 7200, 86400])
+def test_slack_poll_cadence_never_exceeds_a_minute(age):
+    """2026-11-19 rtr-b1g1: the cadence grew to 600 s for cards older than an hour — an owner answer waited up to 10 min."""
+    assert sa.slack_cadence(age, 20) <= 60
+    assert sa.slack_cadence(age, 0) == 0
