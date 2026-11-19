@@ -987,6 +987,7 @@ def tg_cards(ctx: Ctx, rnd_telegram: dict) -> dict[int, dict]:
     if rnd_telegram.get("card_id") is None and not rnd_telegram.get("part_ids"):
         return {}
     return {ctx.chat_id: {"card_id": rnd_telegram.get("card_id"), "part_ids": rnd_telegram.get("part_ids", []),
+                          "body_ids": rnd_telegram.get("body_ids"),
                           "extra_ids": rnd_telegram.get("extra_ids", []),
                           "notice_ids": rnd_telegram.get("notice_ids", [])}}
 
@@ -1079,6 +1080,56 @@ def callback(state: dict, item: dict, action: str) -> str:
     return f"sa|{state['key']}|{item['n']}|{item['round']}|{action}"
 
 
+def slack_root_blocks(ctx: Ctx, state: dict, item: dict, chunks: list, s: dict, diff_head: str = "") -> list:
+    """Blocks of the item's Slack root message (the card): the first line, detail, legend, the first text chunk.
+    `send_round` posts/updates it, `batch_edit` redraws it from the edited item."""
+    line, lab, detail = item_line(state, item), item["labels"], item.get("detail", "")
+    text_mode = state.get("slack_text", "copy")
+    head = [f"*{line}*"] + ([detail] if detail else [])
+    if diff_head:
+        head.append(f"Изменения: {diff_head} — в треде")
+    reason = state.get("slack_text_reason")
+    why = f" (копии нет: {reason})" if reason else ""
+    edit_route = (f"в треде копии: {s['copy_link']}" if s.get("copy_link") else
+                  "в треде этого сообщения" + why if text_mode == "bot-thread" else "в Telegram" + why)
+    options = item.get("options") or []
+    if item.get("notify_only"):
+        legend = "Уведомление от агента — ответа не требуется."
+    elif options:
+        legend = "  ".join([f"{NUM_EMOJI[i]} {opt}" for i, opt in enumerate(options)] +
+                           [f"❌ — {lab['reject']}", f"✍ свой вариант — текстом {edit_route}"])
+    else:
+        legend = f"✅ — {lab['approve']}   ❌ — {lab['reject']}   ✍ правки — текстом {edit_route}"
+    if text_mode == "off" and not item.get("notify_only"):
+        legend = f"✅ — {lab['approve']}   ❌ — {lab['reject']}   Правки — только в Telegram.{why}"
+    head += ["", legend] + ([approve_only_note(item)] if item.get("approve_only") else [])
+    return [section("\n".join(head))] + chunks[:1] + [
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"🤖 {ctx.origin} · slack-ask batch {state['name']}"}]}]
+
+
+def tg_card(ctx: Ctx, state: dict, item: dict) -> tuple[str, dict]:
+    """Text (HTML) and keyboard of the item's Telegram card in its current round — `send_round` sends it,
+    `batch_edit` redraws it."""
+    esc = html.escape
+    line, detail, options = item_line(state, item), item.get("detail", ""), item.get("options") or []
+    buttons, choice_legend = item_buttons(state, item)
+    who = ""
+    if is_multi(state):
+        names = ", ".join(person_name(ctx, state, p["chat_id"]) for p in recipients_of(ctx, state))
+        who = f"Решают: {esc(names)} — решение принято, когда все ответят одинаково."
+        ready = [a for a in (item.get("answers") or {}).values() if a.get("prefilled")]
+        who += "".join(f"\n{esc(a['by'])} уже ответил: {esc(answer_label(item, a))}"
+                       + (f". Аргумент: «{esc(a['argument'])}»" if a.get("argument") else "") for a in ready)
+    card = "\n".join([f"<b>{esc(line)}</b>"] + ([esc(detail)] if detail else []) + [
+        "", choice_legend,
+        ("✍ Свой вариант — нажми кнопку и напиши текст." if options else "Правки — «✍ Правки», затем просто напиши текст."),
+        f"{TO_AGENT} — указание агенту, который прислал вопрос (не правка текста)."]
+        + ([who] if who else [])
+        + ([esc(approve_only_note(item))] if item.get("approve_only") else [])
+        + ["", f"<i>🤖 {esc(ctx.origin)} · {esc(state['name'])}</i>"])
+    return card, {"inline_keyboard": buttons}
+
+
 def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", strict: bool = False) -> None:
     """Show the item under one Slack root and one owner copy; later rounds update the root and reply in both threads.
 
@@ -1115,26 +1166,10 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
                 raise CopyUnavailable(f"{item['id']}: the owner's copy for text corrections was not created: {err}") from err
             warn(f"{item['id']}: copy for text answers not created: {err}")
     chunks = _send_blocks().chunk_markdown(text, BATCH_MD_LIMIT) if text.strip() else []
-    head = [f"*{line}*"] + ([detail] if detail else [])
-    if diff:
-        head.append(f"Изменения: {diff.splitlines()[0]} — в треде")
-    reason = state.get("slack_text_reason")
-    why = f" (копии нет: {reason})" if reason else ""
-    edit_route = (f"в треде копии: {s['copy_link']}" if s.get("copy_link") else
-                  "в треде этого сообщения" + why if text_mode == "bot-thread" else "в Telegram" + why)
+    diff_head = diff.splitlines()[0] if diff else ""
+    s["diff_head"] = diff_head
+    blocks = slack_root_blocks(ctx, state, item, chunks, s, diff_head)
     options = item.get("options") or []
-    if item.get("notify_only"):
-        legend = "Уведомление от агента — ответа не требуется."
-    elif options:
-        legend = "  ".join([f"{NUM_EMOJI[i]} {opt}" for i, opt in enumerate(options)] +
-                           [f"❌ — {lab['reject']}", f"✍ свой вариант — текстом {edit_route}"])
-    else:
-        legend = f"✅ — {lab['approve']}   ❌ — {lab['reject']}   ✍ правки — текстом {edit_route}"
-    if text_mode == "off" and not item.get("notify_only"):
-        legend = f"✅ — {lab['approve']}   ❌ — {lab['reject']}   Правки — только в Telegram.{why}"
-    head += ["", legend] + ([approve_only_note(item)] if item.get("approve_only") else [])
-    blocks = [section("\n".join(head))] + chunks[:1] + [
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"🤖 {ctx.origin} · slack-ask batch {state['name']}"}]}]
     if "slack" in state.get("initial_channels", ["slack", "telegram"]) and is_new_root:
         first = ctx.bot.chat_postMessage(channel=state["slack_channel"], text=line, blocks=blocks,
                                          unfurl_links=False, unfurl_media=False)
@@ -1162,10 +1197,15 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
         if text_mode == "bot-thread":
             s["text_ts"] = s["ts"]
             s["text_channel"] = state["slack_channel"]
-        for fallback, blks in thread:
+        # the thread messages that carry the text (not the diff): `batch_edit` rewrites exactly these in place;
+        # body_start — the index of the first text chunk among them (the root shows chunk 0 itself in round 1)
+        s["body_parts"], s["body_start"] = [], 0 if not is_new_root else 1
+        for k, (fallback, blks) in enumerate(thread):
             reply = ctx.bot.chat_postMessage(channel=state["slack_channel"], thread_ts=s["ts"], text=fallback, blocks=blks,
                                              unfurl_links=False, unfurl_media=False)
             s["parts"].append(str(reply["ts"]))
+            if k >= (1 if diff else 0):
+                s["body_parts"].append(str(reply["ts"]))
     if not is_new_root and text_mode == "copy" and ctx.usr and s.get("copy_ts"):
         preview = (diff.splitlines()[0] if diff else "")
         notice = f"{line} · раунд {r} готов: {preview}\n{text}"
@@ -1180,22 +1220,7 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
         esc = html.escape
         multi = is_multi(state)
         root = tg_cards(ctx, item["rounds"][0].get("telegram", {})) if item["rounds"] else {}
-        buttons, choice_legend = item_buttons(state, item)
-        markup = {"inline_keyboard": buttons}
-        who = ""
-        if multi:
-            names = ", ".join(person_name(ctx, state, p["chat_id"]) for p in recipients_of(ctx, state))
-            who = f"Решают: {esc(names)} — решение принято, когда все ответят одинаково."
-            ready = [a for a in (item.get("answers") or {}).values() if a.get("prefilled")]
-            who += "".join(f"\n{esc(a['by'])} уже ответил: {esc(answer_label(item, a))}"
-                           + (f". Аргумент: «{esc(a['argument'])}»" if a.get("argument") else "") for a in ready)
-        card = "\n".join([f"<b>{esc(line)}</b>"] + ([esc(detail)] if detail else []) + [
-            "", choice_legend,
-            ("✍ Свой вариант — нажми кнопку и напиши текст." if options else "Правки — «✍ Правки», затем просто напиши текст."),
-            f"{TO_AGENT} — указание агенту, который прислал вопрос (не правка текста)."]
-            + ([who] if who else [])
-            + ([esc(approve_only_note(item))] if item.get("approve_only") else [])
-            + ["", f"<i>🤖 {esc(ctx.origin)} · {esc(state['name'])}</i>"])
+        card, markup = tg_card(ctx, state, item)
         # the text folds under an expandable quote (owner, 2026-10-13: «спойлеры — удобно»): the id line
         # stays visible, 30 reports do not flood the chat
         parts = tg_parts(text, len(line) + 80)
@@ -1207,6 +1232,7 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
             try:
                 ids = []
                 root_card = (root.get(int(chat)) or {}).get("card_id") if chat is not None else None
+                has_diff = bool(diff)
                 reply = {"reply_to_message_id": root_card, "allow_sending_without_reply": True} if root_card else {}
                 if diff:
                     ids.append(tg_send(ctx, chat_id=chat, text=f"{line} · изменения\n\n{diff}"[:TG_LIMIT], **reply))
@@ -1215,9 +1241,10 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
                                        text=f"<b>{esc(line)} · текст {i}/{len(parts)}</b>\n"
                                             f"<blockquote expandable>{esc(part)}</blockquote>", **reply))
                 card_id = tg_send(ctx, chat_id=chat, text=card, parse_mode="HTML", reply_markup=markup, **reply)
-                per_chat[str(chat)] = {"part_ids": ids, "card_id": card_id}
+                body_ids = ids[1 if has_diff else 0:]  # the text parts (not the diff): `batch_edit` rewrites them
+                per_chat[str(chat)] = {"part_ids": ids, "card_id": card_id, "body_ids": body_ids}
                 if not multi or chat == ctx.chat_id:
-                    t["part_ids"], t["card_id"] = ids, card_id
+                    t["part_ids"], t["card_id"], t["body_ids"] = ids, card_id, body_ids
             except Exception as err:  # Slack already has the item; Telegram is the second channel
                 warn(f"{item['id']}: Telegram not sent to {chat}: {err}")
                 t["error"] = str(err)
@@ -3378,6 +3405,22 @@ def batch_reply(state: dict, item_id: str, text: str, tg=None, chat_id=None) -> 
     return sent
 
 
+def item_spec_problems(it: dict) -> list[str]:
+    """What is wrong with the payload and the options of one item: the checks of `batch_send` and `batch_edit`."""
+    name, problems = it.get("id"), []
+    if not it.get("payload_file") and "payload" not in it:
+        problems.append(f"{name}: no payload / payload_file")
+    elif it.get("payload_file") and not Path(it["payload_file"]).is_file():
+        problems.append(f"{name}: payload_file not found: {it['payload_file']}")
+    options = it.get("options")
+    if options is not None and (not isinstance(options, list) or not 2 <= len(options) <= 9 or
+                                any(not isinstance(o, str) or not o.strip() for o in options)):
+        problems.append(f"{name}: options must be a list of 2..9 non-empty strings")
+    if it.get("options_text") not in (None, "corrections"):
+        problems.append(f"{name}: options_text must be 'corrections'")
+    return problems
+
+
 def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
     """Create the batch and show every item. Re-running with the same name resumes an interrupted send.
 
@@ -3447,10 +3490,7 @@ def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
         problems = [f"item {n}: no id" for n, i in enumerate(ids, 1) if not i]
         problems += [f"duplicate id {i}" for i in set(ids) if ids.count(i) > 1]
         for it in items:
-            if not it.get("payload_file") and "payload" not in it:
-                problems.append(f"{it.get('id')}: no payload / payload_file")
-            elif it.get("payload_file") and not Path(it["payload_file"]).is_file():
-                problems.append(f"{it.get('id')}: payload_file not found: {it['payload_file']}")
+            problems += item_spec_problems(it)
             problems += [f"{it.get('id')}: {h} must be an argv list or a string" for h in HOOKS
                          if h in it and not isinstance(it[h], (list, str))]
             # {text_file}/{text} are filled only for corrections; on approve they are empty and
@@ -3461,12 +3501,6 @@ def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
                 if "{text_file}" in flat or "{text}" in flat:
                     problems.append(f"{it.get('id')}: {h} uses {{text_file}}/{{text}} — empty outside corrections; "
                                     f"the approved snapshot is {{payload}}")
-            options = it.get("options")
-            if options is not None and (not isinstance(options, list) or not 2 <= len(options) <= 9 or
-                                        any(not isinstance(o, str) or not o.strip() for o in options)):
-                problems.append(f"{it.get('id')}: options must be a list of 2..9 non-empty strings")
-            if it.get("options_text") not in (None, "corrections"):
-                problems.append(f"{it.get('id')}: options_text must be 'corrections'")
             approve_only = bool(it.get("approve_only", spec.get("approve_only")))
             if not it.get("on_approve") and not approve_only:
                 problems.append(f"{it.get('id')}: no on_approve — ✅ would do nothing; give the action (publish hook), "
@@ -3627,6 +3661,245 @@ def batch_cancel(state: dict, ids: list[str] | None, reason: str = CANCEL_REASON
     return done
 
 
+EDIT_FIELDS = ("title", "detail", "now", "ask", "recommendation", "options", "payload", "payload_file")
+EDIT_LABELS = {"title": "заголовок", "detail": "детали", "now": "«что сейчас»", "ask": "вопрос",
+               "recommendation": "рекомендация", "payload": "текст", "payload_file": "текст"}
+
+
+def edit_plan(state: dict, item_id: str, changes: dict) -> dict:
+    """Validate an edit of a sent card without any network call. ValueError (exit 2) when the item is unknown or no
+    longer open, a field is unknown/invalid (the checks of `send`: `item_spec_problems`), or nothing would change.
+    Returns {"item", "fields", "text", "what", "options_changed", "line_changed"}."""
+    item = next((i for i in state["items"] if i["id"] == item_id), None)
+    if item is None:
+        raise ValueError(f"{item_id}: no such item in batch {state['name']}")
+    if item["status"] not in OPEN:
+        raise ValueError(f"{item_id}: {STATUS_RU.get(item['status'], item['status'])} — карточка уже решена или снята, "
+                         "править нечего (новый вопрос — новый item)")
+    unknown = sorted(set(changes) - set(EDIT_FIELDS))
+    if unknown:
+        raise ValueError(f"{item_id}: cannot edit {', '.join(unknown)} (editable: {', '.join(EDIT_FIELDS)})")
+    changes = {k: v for k, v in changes.items() if v is not None}
+    if "payload" in changes and "payload_file" in changes:
+        raise ValueError(f"{item_id}: payload and payload_file together")
+    fields: dict = {}
+    for key, value in changes.items():
+        if key == "options":
+            fields[key] = value
+        elif not isinstance(value, str):
+            raise ValueError(f"{item_id}: {key} must be a string")
+        elif key == "title" and not value.strip():
+            raise ValueError(f"{item_id}: title is empty")
+        else:
+            fields[key] = str(Path(value).resolve()) if key == "payload_file" else value
+    probe = {"id": item_id, "options": fields.get("options", item.get("options")), "options_text": item.get("options_text")}
+    if "payload" in fields:
+        probe["payload"] = fields["payload"]
+    elif fields.get("payload_file") or ("payload" not in changes and item.get("payload_file")):
+        probe["payload_file"] = fields.get("payload_file") or item["payload_file"]
+    else:
+        probe["payload"] = item.get("payload") or ""
+    problems = item_spec_problems(probe)
+    if problems:
+        raise ValueError("spec not ready, nothing changed: " + "; ".join(problems))
+    options_changed = "options" in fields and fields["options"] != (item.get("options") or None)
+    if options_changed and is_multi(state) and item.get("answers"):
+        raise ValueError(f"{item_id}: варианты нельзя менять, пока кто-то из получателей уже ответил "
+                         "(ответы привязаны к номерам) — снять и отправить заново")
+    candidate = json.loads(json.dumps(item))
+    if "payload" in fields:
+        candidate["payload"], candidate["payload_file"] = fields["payload"], None
+    elif "payload_file" in fields:
+        candidate["payload_file"], candidate["payload"] = fields["payload_file"], None
+    try:
+        text = render_payload(candidate) if ("payload" in fields or "payload_file" in fields) else None
+    except OSError as err:
+        raise ValueError(f"{item_id}: payload not readable: {err}") from err
+    what = []
+    for key in ("title", "detail", "now", "ask", "recommendation"):
+        current = item["labels"].get("title") if key == "title" else item.get(key)
+        if key in fields and fields[key] != (current or ""):
+            what.append(EDIT_LABELS[key])
+    if options_changed:
+        what.append(f"варианты ({len(item.get('options') or [])}→{len(fields['options'])})")
+    if text is not None and sha256(text) != item.get("sha256"):
+        what.append("текст")
+    if not what and not item.get("redraw_pending"):
+        raise ValueError(f"{item_id}: нечего менять — значения совпадают с отправленными")
+    return {"item": item, "fields": fields, "text": text, "what": list(dict.fromkeys(what)) or ["перерисовка"],
+            "options_changed": options_changed, "line_changed": "заголовок" in what}
+
+
+def _preset_reactions(options) -> list[str]:
+    return NUM[:len(options)] + ["x"] if options else ["white_check_mark", "x"]
+
+
+def stale_number_reactions(ctx: Ctx, state: dict, s: dict, old: list, new: list) -> list[int]:
+    """Numbers whose meaning the edit changes AND that the owner already put on the root: they must not choose the
+    new option. Slack unreadable → every changed number is treated as stale (a lost click beats a wrong choice)."""
+    label = lambda opts, n: opts[n - 1] if n <= len(opts) else None  # noqa: E731
+    changed = [n for n in range(1, 10) if label(old, n) != label(new, n)]
+    try:
+        msg = _history(ctx.bot, state["slack_channel"], s["ts"], sleep=ctx.sleep).get(s["ts"]) or {}
+        mine = {r.get("name", "").split("::")[0] for r in msg.get("reactions", []) if ctx.owner in r.get("users", [])}
+    except Exception as err:
+        warn(f"owner reactions not read, changed numbers are ignored until toggled: {err}")
+        return [n for n in changed if n <= max(len(old), len(new))]
+    return [n for n in changed if NUM[n - 1] in mine]
+
+
+def _tg_holder(rnd_telegram: dict, chat) -> dict:
+    return rnd_telegram["chats"].setdefault(str(chat), {}) if rnd_telegram.get("chats") else rnd_telegram
+
+
+def _edit_slack_card(ctx: Ctx, state: dict, item: dict, rnd: dict, text: str, rewrite_body: bool) -> None:
+    s, line, channel = rnd["slack"], item_line(state, item), state["slack_channel"]
+    chunks = _send_blocks().chunk_markdown(text, BATCH_MD_LIMIT) if text.strip() else []
+    ctx.bot.chat_update(channel=channel, ts=s["ts"], text=line, blocks=slack_root_blocks(ctx, state, item, chunks, s, s.get("diff_head", "")),
+                        unfurl_links=False, unfurl_media=False)
+    if rewrite_body:
+        old, start = s.get("body_parts"), s.get("body_start", 1)
+        if old is None:  # sent before body_parts were recorded: round 1 — all parts are text; later — unknown, root only
+            old, start = (list(s.get("parts") or []) if item["round"] == 1 else []), 1
+        old, kept = list(old), []
+        for k, block in enumerate(chunks[start:]):
+            label = f"{line} · продолжение {start + k + 1}/{len(chunks)}"
+            blocks = [section(f"*{line}* · продолжение {start + k + 1}/{len(chunks)}"), block]
+            if k < len(old):
+                ctx.bot.chat_update(channel=channel, ts=old[k], text=label, blocks=blocks, unfurl_links=False, unfurl_media=False)
+                kept.append(old[k])
+            else:
+                reply = ctx.bot.chat_postMessage(channel=channel, thread_ts=s["ts"], text=label, blocks=blocks,
+                                                 unfurl_links=False, unfurl_media=False)
+                kept.append(str(reply["ts"]))
+                s["parts"].append(str(reply["ts"]))
+        for ts in old[len(chunks[start:]):]:
+            ctx.bot.chat_update(channel=channel, ts=ts, text=f"{line} · часть заменена правкой",
+                                blocks=[section(f"*{line}* · ✏️ часть заменена правкой — текст сократился, актуальный выше")],
+                                unfurl_links=False, unfurl_media=False)
+        s["body_parts"], s["body_start"] = kept, start
+    if s.get("copy_ts") and ctx.usr and state.get("copy_channel"):
+        try:
+            ctx.usr.chat_update(channel=state["copy_channel"], ts=s["copy_ts"], unfurl_links=False,
+                                text=f"{line} · копия для правок текстом — пиши их в ТРЕДЕ этого сообщения\n{item.get('detail', '')}")
+        except Exception as err:
+            warn(f"{item['id']}: owner copy header not updated: {err}")
+
+
+def _edit_telegram_cards(ctx: Ctx, state: dict, item: dict, rnd: dict, text: str, rewrite_body: bool) -> None:
+    esc, line = html.escape, item_line(state, item)
+    card_text, markup = tg_card(ctx, state, item)
+    parts = tg_parts(text, len(line) + 80)
+    for chat, ids in tg_cards(ctx, rnd["telegram"]).items():
+        card = ids.get("card_id")
+        if not card:
+            continue  # prefilled recipient: no card
+        given = (item.get("answers") or {}).get(str(chat))
+        answered = is_multi(state) and bool(given) and not given.get("prefilled")
+        keyboard = {"inline_keyboard": answered_keyboard(state, item)} if answered else markup
+        tg_cosmetic(ctx, "editMessageText", chat_id=chat, message_id=card, text=card_text, parse_mode="HTML",
+                    reply_markup=keyboard)
+        holder = _tg_holder(rnd["telegram"], chat)
+        body = holder.get("body_ids")
+        if body is None:
+            body = list(holder.get("part_ids") or []) if item["round"] == 1 else None
+        if not rewrite_body or body is None:  # a state sent before body_ids and with a diff message: card only
+            continue
+        body, pieces = list(body), [f"<b>{esc(line)} · текст {i}/{len(parts)}</b>\n<blockquote expandable>{esc(part)}</blockquote>"
+                                    for i, part in enumerate(parts, 1)]
+        for k, piece in enumerate(pieces):
+            if k < len(body):
+                tg_cosmetic(ctx, "editMessageText", chat_id=chat, message_id=body[k], text=piece, parse_mode="HTML")
+            else:
+                mid = tg_send(ctx, chat_id=chat, parse_mode="HTML", text=piece,
+                              reply_to_message_id=card, allow_sending_without_reply=True)
+                body.append(mid)
+                holder.setdefault("part_ids", []).append(mid)
+        for mid in body[len(pieces):]:
+            tg_cosmetic(ctx, "editMessageText", chat_id=chat, message_id=mid, text=f"{item['id']} · ✏️ часть заменена правкой")
+        holder["body_ids"] = body[:len(pieces)]
+
+
+def batch_edit(ctx: Ctx, state: dict, item_id: str, changes: dict, note: str | None = None) -> str:
+    """Redraw a SENT card in place (owner 2026-11-19: «отправленную карточку изменить нельзя — надо, чтобы не
+    спамить карточками»; before, the agent had to cancel + send under a new name: two cards, a re-armed wait, a torn
+    history). The item stays `pending`, so a running `wait` and every answer already given stay valid.
+
+    Slack: `chat_update` of the root (same ts), the text parts of the thread rewritten in place; Telegram:
+    `editMessageText` + the keyboard of the new options in every recipient's card, the text parts rewritten; one short
+    line «✏️ карточка обновлена: …» in the card's thread (Telegram: a reply to the card). A changed payload gets a new
+    sha256 and snapshot — ✅ approves what is shown now. Number reactions whose option changed are not counted.
+    The state is saved first (it is the truth); `redraw_pending` stays until every channel is redrawn, so a failed
+    Slack call is repaired by repeating the same edit. Returns the thread line."""
+    plan = edit_plan(state, item_id, changes)
+    item, fields, rnd = plan["item"], plan["fields"], plan["item"]["rounds"][-1]
+    s, previous_last = rnd["slack"], item.get("last")
+    old_options, new_options = item.get("options") or [], fields.get("options", item.get("options")) or []
+    stale = []
+    if plan["options_changed"] and s.get("ts") and state.get("slack_channel"):
+        stale = stale_number_reactions(ctx, state, s, old_options, new_options)
+        s["used"] = list(dict.fromkeys(s.get("used", []) + [NUM[n - 1] for n in stale]))
+    for key, value in fields.items():
+        if key == "title":
+            item["labels"]["title"] = value
+        elif key == "payload":
+            item["payload"], item["payload_file"] = value, None
+        elif key == "payload_file":
+            item["payload_file"], item["payload"] = value, None
+        else:
+            item[key] = value
+    text = plan["text"]
+    if text is not None:
+        Path(rnd["snapshot"]).write_text(text, encoding="utf-8")
+        item["sha256"] = rnd["sha256"] = sha256(text)
+    else:
+        text = Path(rnd["snapshot"]).read_text(encoding="utf-8")
+    item["revision"], item["edited_at"] = int(item.get("revision") or 0) + 1, now_iso()
+    item["redraw_pending"] = True
+    what = note or ", ".join(plan["what"])
+    journal(state, item, "edited", via="cli", what=what, revision=item["revision"], sha256=item["sha256"])
+    item["last"] = previous_last  # an edit is not a decision: `show`/`wait` keep the last real one
+    save_batch(state)
+    rewrite_body = "текст" in plan["what"] or plan["line_changed"] or plan["what"] == ["перерисовка"]
+    line = f"✏️ карточка обновлена: {what}"
+    if stale:
+        line += f"; реакции {', '.join(str(n) for n in stale)} поставлены до правки и не засчитаны — поставь заново"
+    failed: list[str] = []
+    if s.get("ts") and state.get("slack_channel"):
+        try:
+            if plan["options_changed"]:
+                prev, want = _preset_reactions(old_options), _preset_reactions(new_options)
+                for name in [n for n in want if n not in prev]:
+                    ctx.bot.reactions_add(channel=state["slack_channel"], timestamp=s["ts"], name=name)
+                for name in [n for n in prev if n not in want]:
+                    ctx.bot.reactions_remove(channel=state["slack_channel"], timestamp=s["ts"], name=name)
+        except Exception as err:
+            warn(f"{item_id}: preset reactions not updated: {err}")
+        try:
+            _edit_slack_card(ctx, state, item, rnd, text, rewrite_body)
+            ctx.bot.chat_postMessage(channel=state["slack_channel"], thread_ts=s["ts"], text=line,
+                                     unfurl_links=False, unfurl_media=False)
+        except Exception as err:
+            failed.append(f"Slack: {err}")
+    if ctx.tg and rnd.get("telegram"):
+        try:
+            _edit_telegram_cards(ctx, state, item, rnd, text, rewrite_body)
+            for chat, ids in tg_cards(ctx, rnd["telegram"]).items():
+                card = ids.get("card_id")
+                if card:
+                    mid = tg_send(ctx, chat_id=chat, text=f"{item_id} · {line}", reply_to_message_id=card,
+                                  allow_sending_without_reply=True)
+                    remember_message(state, item, chat, mid)
+        except Exception as err:
+            failed.append(f"Telegram: {err}")
+    if failed:
+        raise RuntimeError(f"{item_id}: state saved, the card is not fully redrawn ({'; '.join(failed)}) — "
+                           "repeat the same edit to finish")
+    item.pop("redraw_pending", None)
+    save_batch(state)
+    return line
+
+
 def review_line(state: dict, item: dict) -> str:
     """«Антон — «текст или вариант»; Коля — «…»» of an item under the agent's review, recipients in order."""
     answers = item.get("answers") or {}
@@ -3708,6 +3981,9 @@ def batch_show(state: dict) -> str:
         lines.append(f"{item['n']:>3}  {item['id']:<12} {item['round']:>2}  {item['status']:<15} "
                      f"{(last.get('decision', '') + ' ' + last.get('via', '')).strip():<34} "
                      f"{res.get('permalink') or res.get('url') or ''}")
+        if item.get("revision"):
+            lines.append(f"       ✏️ ред. {item['revision']} · {item.get('edited_at')}"
+                         + (" · перерисовка не завершена — повтори edit" if item.get("redraw_pending") else ""))
         if item["status"] == "cancelled":
             lines.append(f"       снято: {item.get('cancel_reason') or CANCEL_REASON}")
         if item["status"] == "instructed":
@@ -3874,6 +4150,35 @@ def make_ctx(a, telegram: bool = True) -> Ctx:
     return ctx
 
 
+def edit_changes(a) -> dict:
+    """The fields of `batch edit` from --spec and the flags (flags win). ValueError on a malformed spec."""
+    changes: dict = {}
+    if a.spec:
+        spec = json.loads(a.spec.read_text(encoding="utf-8"))
+        if isinstance(spec, dict) and "items" in spec:
+            spec = next((i for i in spec["items"] if i.get("id") == a.item), None)
+            if spec is None:
+                raise ValueError(f"--spec has no item {a.item}")
+            spec = {k: v for k, v in spec.items() if k in EDIT_FIELDS}
+        if not isinstance(spec, dict):
+            raise ValueError("--spec must be a JSON object")
+        changes.update(spec)
+    if a.detail is not None:
+        changes["detail"] = a.detail
+    if a.detail_file:
+        changes["detail"] = a.detail_file.read_text(encoding="utf-8").strip()
+    if a.payload_file:
+        changes.pop("payload", None)
+        changes["payload_file"] = str(a.payload_file)
+    if a.title is not None:
+        changes["title"] = a.title
+    if a.options_json is not None:
+        changes["options"] = json.loads(a.options_json)
+    if not changes:
+        raise ValueError("nothing to change: give --spec, --detail/--detail-file, --payload-file, --title or --options-json")
+    return changes
+
+
 def batch_cli(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="slack-ask batch", description="many items, each its own ✅/❌/правки")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -3892,7 +4197,19 @@ def batch_cli(argv: list[str]) -> int:
     s.add_argument("--recipients-from", type=Path, metavar="PATH",
                    help=".owner-decisions.json of the project ({channel, owner_name, recipients}): several people "
                         "decide in Telegram (telegram-only, options/approve_only items only)")
-    for p in (s, w):
+    e = sub.add_parser("edit", help="redraw a SENT card in place (Slack chat_update + Telegram editMessageText) instead of "
+                                    "cancel + send; the wait and the answers given stay valid")
+    e.add_argument("--batch", required=True)
+    e.add_argument("--item", required=True)
+    e.add_argument("--spec", type=Path, help="JSON of the changed fields (title, detail, now, ask, recommendation, "
+                                             "options, payload, payload_file) or a send-spec: the item with this id is taken")
+    e.add_argument("--detail")
+    e.add_argument("--detail-file", type=Path)
+    e.add_argument("--payload-file", type=Path)
+    e.add_argument("--title")
+    e.add_argument("--options-json", help='JSON list of 2..9 labels, e.g. \'["A","B"]\'')
+    e.add_argument("--note", help="the «что изменилось» of the thread line (default: the changed fields)")
+    for p in (s, w, e):
         p.add_argument("--no-telegram", action="store_true")
         p.add_argument("--owner", default=os.environ.get("SLACK_ASK_OWNER", "U034A9RE6RF"))
         p.add_argument("--origin", default=os.environ.get("SLACK_ASK_ORIGIN", socket.gethostname()))
@@ -3957,6 +4274,29 @@ def batch_cli(argv: list[str]) -> int:
         except (OSError, ValueError) as err:
             print(f"slack-ask batch wait: {err}", file=sys.stderr)
             return 2
+    if a.cmd == "edit":
+        try:
+            changes = edit_changes(a)
+            state = load_batch(a.batch)
+            edit_plan(state, a.item, changes)  # every refusal here: no client is built, no API call
+        except (OSError, ValueError) as err:
+            print(f"slack-ask batch edit: {err}", file=sys.stderr)
+            return 2
+        try:
+            ctx = make_ctx(a, telegram=not a.no_telegram)
+        except BotAuthFailure as err:
+            warn(str(err))
+            return 5
+        try:
+            print(batch_edit(ctx, state, a.item, changes, note=a.note))
+        except ValueError as err:
+            print(f"slack-ask batch edit: {err}", file=sys.stderr)
+            return 2
+        except RuntimeError as err:
+            print(f"slack-ask batch edit: {err}", file=sys.stderr)
+            return 1
+        print(batch_show(state))
+        return 0
     if a.cmd == "cancel":
         state = load_batch(a.batch)
         tg, chat_id = (None, None) if a.no_telegram else cancel_telegram()

@@ -442,3 +442,150 @@ def test_slack_poll_cadence_never_exceeds_a_minute(age):
     """2026-11-19 rtr-b1g1: the cadence grew to 600 s for cards older than an hour — an owner answer waited up to 10 min."""
     assert sa.slack_cadence(age, 20) <= 60
     assert sa.slack_cadence(age, 0) == 0
+
+
+# --- batch edit: the sent card is redrawn in place (owner 2026-11-19) -----------------------------------------------
+
+EDIT_SPEC = {
+    "title": "edit", "approve_only": True,
+    "items": [{"id": "TASK-201", "title": "выбор", "detail": "старая деталь", "payload": "Текст вопроса",
+               "options": ["A", "B"]}],
+}
+
+
+def _sent_for_edit(env, name="b-edit"):
+    c = env.ctx()
+    st = sa.batch_send(c, json.loads(json.dumps(EDIT_SPEC)), name)
+    rnd = st["items"][0]["rounds"][0]
+    return c, st["key"], rnd["slack"]["ts"], rnd["telegram"]["card_id"]
+
+
+def _api_calls(env) -> int:
+    return len(env.tg.calls) + len(env.ws.chat_updates) + sum(len(v) for v in env.ws.messages.values())
+
+
+def test_edit_detail_redraws_both_cards_in_place_and_adds_one_thread_line(env):
+    c, _key, ts, card = _sent_for_edit(env)
+    roots, calls0, updates0 = len(env.ws.top("DBOT")), len(env.tg.calls), len(env.ws.chat_updates)
+    thread0 = len(env.ws.thread("DBOT", ts))
+
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"detail": "новая деталь"})
+
+    mine = [u for u in env.ws.chat_updates[updates0:] if u[1] == ts]
+    assert len(mine) == 1 and mine[0][0] == "DBOT"
+    assert "новая деталь" in json.dumps(mine[0][3], ensure_ascii=False)
+    assert len(env.ws.top("DBOT")) == roots
+    added = env.ws.thread("DBOT", ts)[thread0:]
+    assert len(added) == 1 and added[0]["text"].startswith("✏️ карточка обновлена")
+    edits = [p for m, p in env.tg.calls[calls0:] if m == "editMessageText"]
+    assert len(edits) == 1 and edits[0]["message_id"] == card
+    assert "новая деталь" in edits[0]["text"]
+    buttons = [b["text"] for row in edits[0]["reply_markup"]["inline_keyboard"] for b in row]
+    assert any("A" in b for b in buttons) and any("B" in b for b in buttons)
+    sends = [p for m, p in env.tg.calls[calls0:] if m == "sendMessage"]
+    assert all(p.get("reply_to_message_id") == card for p in sends), "a Telegram notice must be a reply, not a root"
+    st = sa.load_batch("b-edit")
+    assert st["items"][0]["detail"] == "новая деталь" and st["items"][0]["revision"] == 1
+    assert "ред. 1" in sa.batch_show(st)
+
+
+def test_edit_does_not_interrupt_wait_and_owner_choice_still_counts(env):
+    c, key, _ts, _card = _sent_for_edit(env)
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"detail": "новая деталь", "payload": "Новый текст"})
+    assert sa.load_batch("b-edit")["items"][0]["status"] == "pending"
+    env.tg.tap(f"sa|{key}|1|1|c2")
+    assert sa.batch_watch(c, names=["b-edit"], timeout=20, slack_poll=0, tg_poll=5) == 0
+    item = sa.load_batch("b-edit")["items"][0]
+    assert item["status"] == "done" and item["choice"] == 2 and item["choice_label"] == "B"
+    assert sa.batch_wait("b-edit", None, timeout=5, poll=0, clock=env.clock, sleep=env.clock.sleep) == 0
+
+
+def test_edit_of_decided_item_exits_2_without_api_calls(env, monkeypatch, capsys):
+    c, key, _ts, _card = _sent_for_edit(env)
+    env.tg.tap(f"sa|{key}|1|1|c1")
+    sa.batch_watch(c, names=["b-edit"], timeout=20, slack_poll=0, tg_poll=5)
+    assert sa.load_batch("b-edit")["items"][0]["status"] == "done"
+    monkeypatch.setattr(sa, "make_ctx", lambda args, telegram=True: env.ctx())
+    before = _api_calls(env)
+    assert sa.batch_cli(["edit", "--batch", "b-edit", "--item", "TASK-201", "--detail", "поздно"]) == 2
+    assert "уже решена" in capsys.readouterr().err
+    assert _api_calls(env) == before
+
+
+def test_edit_that_changes_options_ignores_stale_number_reaction(env):
+    c, _key, ts, _card = _sent_for_edit(env)
+    env.ws.react("DBOT", ts, "two", OWNER)  # «B» — not yet polled
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"options": ["A", "новый вариант"]})
+    note = env.ws.thread("DBOT", ts)[-1]["text"]
+    assert "✏️ карточка обновлена" in note and "2" in note and "реакци" in note
+    states = {"b-edit": sa.load_batch("b-edit")}
+    sa.poll_slack_batches(c, states)
+    sa.save_batch(states["b-edit"])
+    assert sa.load_batch("b-edit")["items"][0]["status"] == "pending", "the old reaction must not choose the new option"
+    # a fresh reaction after toggling off/on counts as before
+    env.ws.find("DBOT", ts)["reactions"] = [r for r in env.ws.find("DBOT", ts)["reactions"] if r["name"] != "two"]
+    states = {"b-edit": sa.load_batch("b-edit")}
+    sa.poll_slack_batches(c, states)
+    sa.save_batch(states["b-edit"])
+    env.ws.react("DBOT", ts, "two", OWNER)
+    states = {"b-edit": sa.load_batch("b-edit")}
+    sa.poll_slack_batches(c, states)
+    sa.save_batch(states["b-edit"])
+    item = sa.load_batch("b-edit")["items"][0]
+    assert item["status"] == "done" and item["choice_label"] == "новый вариант"
+
+
+@pytest.mark.parametrize("changes", [{"options": ["один"]}, {"options": ["a", ""]}, {"payload_file": "/nonexistent/p.md"},
+                                     {}, {"options": ["a"] * 10}])
+def test_edit_with_invalid_spec_is_refused_without_api_calls(env, changes):
+    c, _key, _ts, _card = _sent_for_edit(env)
+    before = _api_calls(env)
+    with pytest.raises(ValueError):
+        sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", changes)
+    assert _api_calls(env) == before
+
+
+def test_edit_cli_spec_file_invalid_exits_2_before_any_client(env, monkeypatch, tmp_path, capsys):
+    _sent_for_edit(env)
+    spec = tmp_path / "e.json"
+    spec.write_text(json.dumps({"options": ["only-one"]}), encoding="utf-8")
+
+    def boom(args, telegram=True):
+        raise AssertionError("no client may be built for a refused edit")
+
+    monkeypatch.setattr(sa, "make_ctx", boom)
+    assert sa.batch_cli(["edit", "--batch", "b-edit", "--item", "TASK-201", "--spec", str(spec)]) == 2
+    assert "options" in capsys.readouterr().err
+
+
+def test_edit_payload_updates_snapshot_sha_and_text_in_place(env):
+    c, _key, ts, card = _sent_for_edit(env)
+    calls0 = len(env.tg.calls)
+    sa.batch_edit(c, sa.load_batch("b-edit"), "TASK-201", {"payload": "Совсем другой текст"})
+    item = sa.load_batch("b-edit")["items"][0]
+    assert item["sha256"] == sa.sha256("Совсем другой текст") == item["rounds"][-1]["sha256"]
+    assert pathlib.Path(item["rounds"][-1]["snapshot"]).read_text(encoding="utf-8") == "Совсем другой текст"
+    root = env.ws.find("DBOT", ts)
+    assert "Совсем другой текст" in json.dumps(root["blocks"], ensure_ascii=False)
+    body = [p for m, p in env.tg.calls[calls0:] if m == "editMessageText" and p["message_id"] != card]
+    assert body and "Совсем другой текст" in body[0]["text"]
+
+
+def test_edit_shrinking_long_payload_marks_old_continuations_replaced_without_new_messages(env):
+    c = env.ctx()
+    spec = json.loads(json.dumps(EDIT_SPEC))
+    spec["items"][0]["payload"] = "длинная строка текста\n" * 600
+    st = sa.batch_send(c, spec, "b-long")
+    ts = st["items"][0]["rounds"][0]["slack"]["ts"]
+    parts = st["items"][0]["rounds"][0]["slack"]["body_parts"]
+    tg_body = st["items"][0]["rounds"][0]["telegram"]["body_ids"]
+    assert len(parts) >= 2 and len(tg_body) >= 2
+    posts0, calls0 = sum(len(v) for v in env.ws.messages.values()), len(env.tg.calls)
+    sa.batch_edit(c, sa.load_batch("b-long"), "TASK-201", {"payload": "коротко"})
+    assert sum(len(v) for v in env.ws.messages.values()) == posts0 + 1  # only the «✏️» line
+    for part_ts in parts:
+        assert "заменена" in env.ws.find("DBOT", part_ts)["text"]
+    edited = {p["message_id"]: p["text"] for m, p in env.tg.calls[calls0:] if m == "editMessageText"}
+    assert "коротко" in edited[tg_body[0]] and all("заменена" in edited[mid] for mid in tg_body[1:])
+    item = sa.load_batch("b-long")["items"][0]
+    assert item["rounds"][0]["slack"]["body_parts"] == [] and item["rounds"][0]["telegram"]["body_ids"] == tg_body[:1]
