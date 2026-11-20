@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import pathlib
 import sys
 import types
@@ -158,6 +159,57 @@ class FakeTelegram:
         self.next_update += 1
 
 
+SYSTEM_CALLS: list[list[str]] = []
+
+
+@pytest.fixture(autouse=True)
+def _sandbox(tmp_path, monkeypatch):
+    """No test touches the real machine (2026-11-20 incident: tests typed fixture «owner decisions» into the live
+    orchestrator session via real `tmux send-keys`): HOME and ~/.claude in tmp, PATH stubs for tmux/claude that exit
+    97, no inherited session id, and the real Runner refuses tmux/claude/ps — only a fake `ctx.runner` may answer."""
+    home = tmp_path / "sandbox-home"
+    stubs = tmp_path / "stub-bin"
+    stubs.mkdir()
+    for tool in ("tmux", "claude"):
+        (stubs / tool).write_text("#!/bin/sh\nexit 97\n")
+        (stubs / tool).chmod(0o755)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", f"{stubs}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(sa, "CLAUDE_HOME", home / ".claude")
+    SYSTEM_CALLS.clear()
+
+    def refuse(kind):
+        def guard(self, argv, *args, **kwargs):
+            SYSTEM_CALLS.append(list(argv))
+            if kind == "run" or pathlib.Path(argv[0]).name in ("tmux", "claude", "ps"):
+                raise AssertionError(f"real system call through the production Runner: {argv[:4]}")
+            return real_start(self, argv, *args, **kwargs)
+        return guard
+
+    real_start = sa.Runner.start
+    monkeypatch.setattr(sa.Runner, "run", refuse("run"))
+    monkeypatch.setattr(sa.Runner, "start", refuse("start"))
+    yield
+    stray = [c for c in SYSTEM_CALLS if c]
+    SYSTEM_CALLS.clear()
+    assert not stray or getattr(sa, "_GUARD_SELFTEST", False), f"production code reached the system seam: {stray[:3]}"
+
+
+def test_sandbox_guard_refuses_real_tmux_claude_and_stubs_exit_97(tmp_path):
+    """The guard: the production Runner may not call tmux/claude/ps, and a stray subprocess reaches only the stubs."""
+    import subprocess
+    with pytest.raises(AssertionError):
+        sa.Runner().run(["tmux", "send-keys", "-t", "%1", "-l", "x"])
+    with pytest.raises(AssertionError):
+        sa.Runner().start(["claude", "--bg", "--resume", "s"], tmp_path / "l", tmp_path / "e")
+    SYSTEM_CALLS.clear()  # the two refusals above are the point of this test
+    assert subprocess.run(["tmux", "list-panes"]).returncode == 97
+    assert subprocess.run(["claude", "--version"]).returncode == 97
+    assert os.environ["HOME"].endswith("sandbox-home") and "CLAUDE_CODE_SESSION_ID" not in os.environ
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(sa, "BATCH_HOME", tmp_path / "home")
@@ -170,7 +222,7 @@ def env(tmp_path, monkeypatch):
     def ctx(tg_on: bool = True, usr: FakeClient | None = None):
         u = FakeClient(ws, OWNER) if usr is None else usr
         return sa.Ctx(FakeClient(ws, BOT), u, tg if tg_on else None, TG_OWNER, owner=OWNER,
-                      origin="rdsh2", clock=clock, sleep=clock.sleep)
+                      origin="rdsh2", clock=clock, sleep=clock.sleep, runner=FakeRunner())
 
     return types.SimpleNamespace(ws=ws, tg=tg, clock=clock, ctx=ctx, home=tmp_path / "home", tmp_path=tmp_path)
 
