@@ -771,3 +771,223 @@ def test_edit_retry_after_failed_redraw_rewrites_the_text_parts_too(env, monkeyp
     monkeypatch.setattr(Workspace, "update", real)
     sa.batch_edit(c, sa.load_batch("b-retry"), "TASK-201", {"payload": "коротко"})
     assert all("заменена" in env.ws.find("DBOT", ts)["text"] for ts in parts)
+
+
+# --- delivery to a live agent session (2026-11-20) --------------------------------------------------------
+
+class FakeRunner:
+    """The system seam: records every `run` (tmux, ps) and `start` (claude --bg --resume), answers from tables."""
+
+    def __init__(self, panes: str = "", parents: dict | None = None, start_result=(0, "")) -> None:
+        self.panes, self.parents, self.start_result = panes, parents or {}, start_result
+        self.runs: list[list[str]] = []
+        self.starts: list[dict] = []
+        self.tmux_fail = False
+
+    def run(self, argv, timeout=10):
+        self.runs.append(list(argv))
+        if argv[0] == "tmux" and argv[1] == "list-panes":
+            return 0, self.panes
+        if argv[0] == "tmux":
+            return (1, "no server") if self.tmux_fail else (0, "")
+        if argv[0] == "ps":
+            return 0, f"{self.parents.get(int(argv[-1]), 1)}\n"
+        return 127, ""
+
+    def start(self, argv, log, exit_file, cwd=None):
+        handle = {"pid": 1, "log": str(log), "exit_file": str(exit_file), "argv": argv, "cwd": cwd}
+        self.starts.append(handle)
+        return handle
+
+    def poll(self, handle):
+        return self.start_result
+
+
+SESSION = "988096f9-0000-0000-0000-000000000000"
+
+
+@pytest.fixture
+def agent(env, monkeypatch):
+    """A batch whose agent session lives on this host; ~/.claude is a tmp dir."""
+    home = env.tmp_path / "claude"
+    (home / "sessions").mkdir(parents=True)
+    monkeypatch.setattr(sa, "CLAUDE_HOME", home)
+    monkeypatch.setattr(sa.socket, "gethostname", lambda: "rdsh2")
+    alive = {"pids": set()}
+    monkeypatch.setattr(sa, "_pid_alive", lambda pid: pid in alive["pids"])
+
+    def session_file(pid: int, cwd: str | None = "/work/project", live: bool = True) -> None:
+        data = {"pid": pid, "sessionId": SESSION}
+        if cwd:
+            data["cwd"] = cwd
+        (home / "sessions" / f"{pid}.json").write_text(json.dumps(data), encoding="utf-8")
+        if live:
+            alive["pids"].add(pid)
+
+    def make(name: str, runner: FakeRunner, options=("да", "нет")):
+        c = env.ctx()
+        c.runner = runner
+        st = sa.batch_send(c, {"title": "T", "channels": {"mode": "slack-first", "escalate_after": 0},
+                               "approve_only": True,
+                               "items": [{"id": "TASK-1", "title": "Что делаем?", "payload": "Текст",
+                                          "options": list(options)}]}, name)
+        st["origin"] = {"session_id": SESSION, "cwd": "/home/user", "host": "rdsh2"}
+        sa.save_batch(st)
+        return c, st
+
+    return types.SimpleNamespace(home=home, session_file=session_file, make=make)
+
+
+def _ask(c, st, text="уточни, пожалуйста"):
+    item = st["items"][0]
+    return sa.to_agent(c, st, item, text, "telegram:to_agent")
+
+
+def test_delivery_wait_alive_goes_to_wait(env, agent):
+    runner = FakeRunner()
+    c, st = agent.make("d-wait", runner)
+    sa.wait_heartbeat("d-wait", env.clock())
+    _ask(c, st)
+    assert st["to_agent"][-1]["delivered"] == "wait"
+    assert runner.runs == [] and runner.starts == []
+
+
+def test_delivery_live_process_gets_tmux_send_keys(env, agent):
+    agent.session_file(4242)
+    runner = FakeRunner(panes="100 %1\n200 %7\n", parents={4242: 150, 150: 200})
+    c, st = agent.make("d-tmux", runner)
+    _ask(c, st, "сделай вариант 2")
+    assert st["to_agent"][-1]["delivered"] == "tmux:%7"
+    sends = [r for r in runner.runs if r[:2] == ["tmux", "send-keys"]]
+    assert sends[0][:5] == ["tmux", "send-keys", "-t", "%7", "-l"] and "сделай вариант 2" in sends[0][5]
+    assert sends[1] == ["tmux", "send-keys", "-t", "%7", "Enter"]
+    assert runner.starts == []  # no copy of a live session
+
+
+def test_delivery_no_process_resumes_in_project_cwd_from_sessions_file(env, agent):
+    agent.session_file(4243, cwd="/work/project", live=False)
+    runner = FakeRunner()
+    c, st = agent.make("d-resume", runner)
+    _ask(c, st)
+    assert st["to_agent"][-1]["delivered"] == "resume"
+    assert runner.starts[0]["cwd"] == "/work/project"  # not origin.cwd=/home/user
+    assert runner.starts[0]["argv"][1:4] == ["--bg", "--resume", SESSION]
+
+
+def test_delivery_no_process_cwd_from_transcript(env, agent):
+    proj = agent.home / "projects" / "-work-project"
+    proj.mkdir(parents=True)
+    (proj / f"{SESSION}.jsonl").write_text('{"type":"summary"}\n{"type":"user","cwd":"/work/from-transcript"}\n',
+                                          encoding="utf-8")
+    runner = FakeRunner()
+    c, st = agent.make("d-transcript", runner)
+    _ask(c, st)
+    assert runner.starts[0]["cwd"] == "/work/from-transcript"
+
+
+def test_delivery_resume_exit_1_is_failed_and_owner_is_told(env, agent):
+    agent.session_file(4244, live=False)
+    runner = FakeRunner(start_result=(1, "Workspace not trusted"))
+    c, st = agent.make("d-fail", runner)
+    _ask(c, st)
+    sa.poll_slack(c, st)
+    note = st["to_agent"][-1]
+    assert note["delivered"].startswith("failed:") and "Workspace not trusted" in note["delivered"]
+    told = [p["text"] for m, p in env.tg.calls if m == "sendMessage" and "не доставил агенту" in p.get("text", "")]
+    assert len(told) == 1 and "Workspace not trusted" in told[0]
+
+
+def test_delivery_resume_copy_of_live_session_is_failed(env, agent):
+    agent.session_file(4245, live=False)
+    runner = FakeRunner(start_result=(0, "note: session 988096f9 is open in another Claude Code process, so this started a copy"))
+    c, st = agent.make("d-copy", runner)
+    _ask(c, st)
+    sa.poll_slack(c, st)
+    assert st["to_agent"][-1]["delivered"].startswith("failed:")
+
+
+def test_delivery_tmux_error_is_failed(env, agent):
+    agent.session_file(4246)
+    runner = FakeRunner(panes="300 %2\n", parents={4246: 300})
+    runner.tmux_fail = True
+    c, st = agent.make("d-tmuxfail", runner)
+    # list-panes succeeds in the fake; make send-keys fail
+    reply = _ask(c, st)
+    assert st["to_agent"][-1]["delivered"].startswith("failed:") and "не доставил агенту" in reply
+
+
+# --- thread after decision (B) ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", ["cancelled", "done"])
+def test_owner_reply_in_thread_of_closed_item_goes_to_agent(env, agent, status):
+    runner = FakeRunner()
+    c, st = agent.make(f"b-{status}", runner)
+    item = st["items"][0]
+    copy_ts = item["rounds"][0]["slack"]["copy_ts"]
+    item["status"] = status
+    sa.journal(st, item, status, via="test")
+    env.ws.post(OWNER, "DSELF", "эта задача не относится к эпику комбо", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {st["name"]: st})
+    assert [n["via"] for n in st["to_agent"]] == ["slack:after_decision"]
+    assert st["to_agent"][0]["text"] == "после решения: эта задача не относится к эпику комбо"
+    assert item["status"] == status and item.get("choice") is None
+
+
+def test_thread_of_closed_item_is_not_polled_after_72h(env, agent, monkeypatch):
+    c, st = agent.make("b-late", FakeRunner())
+    item = st["items"][0]
+    copy_ts = item["rounds"][0]["slack"]["copy_ts"]
+    item["status"] = "cancelled"
+    sa.journal(st, item, "cancelled", via="test")
+    real = sa.time.time()
+    c.clock = lambda: real + 73 * 3600
+    env.ws.post(OWNER, "DSELF", "поздно", thread_ts=copy_ts)
+    assert sa.slack_groups(c, {st["name"]: st}) == {}
+    sa.poll_slack_batches(c, {st["name"]: st})
+    assert st.get("to_agent") in (None, [])
+    c.clock = lambda: real + 71 * 3600
+    assert sa.slack_groups(c, {st["name"]: st}) != {}
+
+
+# --- question anywhere (C) and thread decision delivery (D) ------------------------------------------------
+
+def test_question_mark_in_the_middle_goes_to_agent(env, agent):
+    c, st = agent.make("c-mid", FakeRunner())
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    text = "не понял почему нельзя почистить меню…? или не поломаное? можно нового партнера или новую точку просто"
+    env.ws.post(OWNER, "DSELF", text, thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {st["name"]: st})
+    item = st["items"][0]
+    assert item["status"] in sa.OPEN and item.get("choice") is None
+    assert [n["via"] for n in st["to_agent"]] == ["slack:thread-question"]
+
+
+def test_choice_token_with_question_mark_is_still_a_choice(env, agent):
+    c, st = agent.make("c-two", FakeRunner(), options=("да", "нет"))
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "2, но почему так дорого?", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {st["name"]: st})
+    assert st["items"][0]["choice"] == 2
+
+
+def test_thread_decision_is_delivered_when_wait_is_not_alive(env, agent):
+    agent.session_file(4247, cwd="/work/project", live=False)
+    runner = FakeRunner()
+    c, st = agent.make("d-decision", runner)
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "2", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {st["name"]: st})
+    assert st["items"][0]["choice"] == 2
+    [rec] = st["deliveries"]
+    assert rec["delivered"] == "resume" and "решение владельца по TASK-1: нет" in rec["text"]
+    assert runner.starts[0]["cwd"] == "/work/project"
+
+
+def test_thread_decision_not_delivered_when_wait_alive(env, agent):
+    runner = FakeRunner()
+    c, st = agent.make("d-decision-wait", runner)
+    sa.wait_heartbeat("d-decision-wait", env.clock())
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "1", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {st["name"]: st})
+    assert st["items"][0]["choice"] == 1 and not st.get("deliveries") and runner.starts == []

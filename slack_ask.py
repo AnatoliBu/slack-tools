@@ -819,6 +819,14 @@ class Runner:
         self.procs[str(exit_file)] = proc
         return {"pid": proc.pid, "log": str(log), "exit_file": str(exit_file), "argv": argv, "started": now_iso()}
 
+    def run(self, argv: list[str], timeout: float = 10) -> tuple[int, str]:
+        """A short synchronous system call (tmux, ps) → (exit code, output); a tests' seam like `start`."""
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError) as err:
+            return 127, str(err)
+        return done.returncode, (done.stdout or "") + (done.stderr or "")
+
     def poll(self, handle: dict) -> tuple[int, str] | None:
         exit_file, log = Path(handle["exit_file"]), Path(handle["log"])
         proc = self.procs.get(str(exit_file))
@@ -2305,10 +2313,28 @@ def _fallback_owner_text(ctx: Ctx, states: dict[str, dict]) -> None:
             warn(f"owner Slack auth notification failed: {notify_err}")
 
 
+TERMINAL = ("done", "rejected", "instructed", "commented", "expired", "cancelled")
+AFTER_DECISION_WINDOW_S = 72 * 3600  # the copy thread of a closed item is still read this long after its last event
+
+
+def in_after_window(ctx: Ctx, item: dict) -> bool:
+    """A terminal item whose last event is younger than 72 h: the owner may still write into its thread
+    (2026-11-20: «эта задача не относится к эпику» came 12 min after the cancel and was lost)."""
+    if not item.get("rounds") or item["status"] not in TERMINAL:
+        return False
+    try:
+        last = datetime.datetime.strptime(item["last"]["at"], "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (KeyError, TypeError, ValueError):
+        return False
+    return ctx.clock() - last <= AFTER_DECISION_WINDOW_S
+
+
 def poll_slack(ctx: Ctx, state: dict, cache: dict | None = None) -> None:
     """One history call per channel for all waiting items: reactions on the bot messages, replies in copies."""
+    check_deliveries(ctx, state)
     live = [i for i in state["items"] if i["rounds"] and i["status"] in OPEN + ("correcting",)]
     opened = [i for i in live if i["status"] in OPEN]
+    live += [i for i in state["items"] if in_after_window(ctx, i)]  # their threads only: no reactions, no decisions
     if opened and state.get("slack_channel"):
         msgs = (cache or {}).get((id(ctx.bot), state["slack_channel"])) or _history(
             ctx.bot, state["slack_channel"], min(i["rounds"][-1]["slack"]["ts"] for i in opened))
@@ -2359,13 +2385,21 @@ def poll_slack(ctx: Ctx, state: dict, cache: dict | None = None) -> None:
             text = "\n\n".join(html.unescape(r.get("text", "")) for r in new if r.get("user") == ctx.owner)
             if not text.strip():
                 continue
+            if item["status"] in TERMINAL:  # closed: the owner's word goes to the agent, status and choice stay
+                to_agent(ctx, state, item, f"после решения: {text}", "slack:after_decision", chat=ctx.chat_id)
+                state["to_agent"][-1]["after_decision"] = True
+                continue
             if item["status"] in OPEN and item.get("options") and item.get("options_text") != "corrections" \
-                    and ends_with_question(text.strip()) and not text_choice(text, len(item["options"])):
-                # a question to the agent, not an own option (2026-11-19 rtr-b1g1: choice=0, label = the question)
+                    and "?" in text and not text_choice(text, len(item["options"])):
+                # a question to the agent, not an own option (2026-11-19 rtr-b1g1: choice=0, label = the question;
+                # 2026-11-20 plat4640-boot686: the «?» was in the middle of the text)
                 to_agent(ctx, state, item, text, "slack:thread-question", chat=ctx.chat_id,
                          response="Передал агенту как вопрос")
                 continue
             decide(ctx, state, item, "e", "slack:thread", text)
+            if item["status"] not in OPEN + ("correcting",) or item.get("choice") is not None:
+                deliver_decision(ctx, state, item, f"решение владельца по {item['id']}: "
+                                 f"{item.get('choice_label') or text}")
 
 
 def slack_groups(ctx: Ctx, states: dict[str, dict]) -> dict:
@@ -2385,13 +2419,15 @@ def slack_groups(ctx: Ctx, states: dict[str, dict]) -> dict:
             key = (id(client), channel)
             key_name = "copy_ts" if mode == "copy" else "text_ts"
             ts = [i["rounds"][-1]["slack"][key_name] for i in state["items"]
-                  if i["status"] in OPEN + ("correcting",) and i["rounds"] and i["rounds"][-1]["slack"].get(key_name)]
+                  if (i["status"] in OPEN + ("correcting",) or in_after_window(ctx, i)) and i["rounds"]
+                  and i["rounds"][-1]["slack"].get(key_name)]
             if ts:
                 groups.setdefault(key, (client, [], []))[1].extend(ts)
                 groups[key][2].append(name)
         if mode != "copy" and ctx.usr is not None and state.get("copy_channel"):
             copy_ts = [i["rounds"][-1]["slack"]["copy_ts"] for i in state["items"]
-                       if i["status"] in OPEN + ("correcting",) and i["rounds"] and i["rounds"][-1]["slack"].get("copy_ts")]
+                       if (i["status"] in OPEN + ("correcting",) or in_after_window(ctx, i)) and i["rounds"]
+                       and i["rounds"][-1]["slack"].get("copy_ts")]
             if copy_ts:
                 ckey = (id(ctx.usr), state["copy_channel"])
                 groups.setdefault(ckey, (ctx.usr, [], []))[1].extend(copy_ts)
@@ -3333,10 +3369,152 @@ def wait_alive(name: str, now: float) -> bool:
         return False
 
 
+CLAUDE_HOME = Path(os.environ.get("SLACK_ASK_CLAUDE_HOME") or Path.home() / ".claude")
+COPY_MARK = "is open in another Claude Code process"  # `claude --bg --resume` on a live session starts a copy
+
+
+def session_records(session_id: str) -> list[dict]:
+    """`~/.claude/sessions/<pid>.json` files of this session: [{pid, cwd, alive}], live ones first."""
+    found = []
+    for f in sorted((CLAUDE_HOME / "sessions").glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or data.get("sessionId") != session_id:
+            continue
+        pid = data.get("pid") or (int(f.stem) if f.stem.isdigit() else None)
+        found.append({"pid": pid, "cwd": data.get("cwd"), "alive": bool(pid) and _pid_alive(pid)})
+    return sorted(found, key=lambda r: not r["alive"])
+
+
+def session_cwd(session_id: str) -> str | None:
+    """The project folder of the session — from its sessions file, else from the first transcript line with `cwd`.
+    Never `origin.cwd`: that is where `send` was run (`~`), and `claude --resume` there says «Workspace not trusted»."""
+    for rec in session_records(session_id):
+        if rec.get("cwd"):
+            return rec["cwd"]
+    for transcript in sorted((CLAUDE_HOME / "projects").glob(f"*/{session_id}.jsonl")):
+        try:
+            with open(transcript, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except (ValueError, AttributeError):
+                        continue
+                    if cwd:
+                        return cwd
+        except OSError:
+            continue
+    return None
+
+
+def tmux_pane_of(ctx: "Ctx", pid: int) -> tuple[str | None, str]:
+    """The tmux pane whose process is `pid` or its ancestor → (pane id, reason when none)."""
+    code, out = ctx.runner.run(["tmux", "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}"])
+    if code != 0:
+        return None, f"tmux: {out.strip()[:120] or code}"
+    panes = {}
+    for line in out.splitlines():
+        head, _, pane = line.strip().partition(" ")
+        if head.isdigit() and pane:
+            panes[int(head)] = pane
+    current = int(pid)
+    for _ in range(32):
+        if current in panes:
+            return panes[current], ""
+        code, out = ctx.runner.run(["ps", "-o", "ppid=", "-p", str(current)])
+        parent = out.strip()
+        if code != 0 or not parent.isdigit() or int(parent) <= 1:
+            break
+        current = int(parent)
+    return None, f"процесс {pid} не в tmux"
+
+
+def deliver_to_session(ctx: "Ctx", state: dict, rec: dict, session_id: str, brief: str, stem: str) -> str:
+    """Text to the agent's session when nobody is in `batch wait` → what is written into `delivered`:
+    `tmux:<pane>` (typed into the live session), `resume` (`claude --bg --resume` in the session's project folder;
+    its outcome is collected by `check_deliveries`) or `failed:<reason>`. Never `origin.cwd`."""
+    live = next((r for r in session_records(session_id) if r["alive"]), None)
+    if live:
+        pane, why = tmux_pane_of(ctx, live["pid"])
+        if not pane:
+            return f"failed:{why}"
+        one_line = " ".join(brief.split())
+        for argv in (["tmux", "send-keys", "-t", pane, "-l", one_line], ["tmux", "send-keys", "-t", pane, "Enter"]):
+            code, out = ctx.runner.run(argv)
+            if code != 0:
+                return f"failed:tmux send-keys {pane}: {out.strip()[:120] or code}"
+        return f"tmux:{pane}"
+    cwd = session_cwd(session_id)
+    if not cwd:
+        return "failed:каталог проекта сессии не найден (ни в ~/.claude/sessions, ни в транскрипте)"
+    d = batch_dir(state["name"])
+    try:
+        rec["hook"] = ctx.runner.start([CLAUDE_BIN, "--bg", "--resume", session_id, brief],
+                                       d / f"{stem}.log", d / f"{stem}.exit", cwd=cwd)
+    except OSError as err:
+        return f"failed:resume не запустился: {err}"
+    return "resume"
+
+
+def check_deliveries(ctx: "Ctx", state: dict) -> None:
+    """The outcome of every background `--resume` delivery: exit≠0, or exit 0 with «started a copy», is `failed:…` in
+    `delivered` + one line to the owner in Telegram (2026-11-20: 15 of 15 were journaled `resume`, none arrived)."""
+    for rec in (state.get("to_agent") or []) + (state.get("deliveries") or []):
+        hook = rec.get("hook")
+        if rec.get("delivered") != "resume" or not hook:
+            continue
+        res = ctx.runner.poll(hook)
+        if res is None:
+            continue
+        code, output = res
+        if code == 0 and COPY_MARK not in output:
+            rec["hook"] = None
+            continue
+        tail = " ".join(output.split())[-160:]
+        reason = f"resume exit {code}: {tail}" if code != 0 else f"resume запустил копию, а не живую сессию: {tail}"
+        rec["delivered"], rec["hook"] = f"failed:{reason}", None
+        item = next((i for i in state["items"] if i["id"] == rec.get("id")), None)
+        if item is not None:
+            journal(state, item, "delivery_failed", via=rec.get("via"), text=rec.get("text"), delivered=rec["delivered"])
+        report_delivery_failure(ctx, state, rec)
+        save_batch(state)
+
+
+def report_delivery_failure(ctx: "Ctx", state: dict, rec: dict) -> None:
+    if not ctx.tg:
+        return
+    try:
+        tg_send(ctx, text=f"{rec.get('id', '')} · не доставил агенту: {rec['delivered'][len('failed:'):]}".strip(" ·"))
+    except Exception as err:
+        warn(f"delivery failure notice lost: {err}")
+
+
+def deliver_decision(ctx: "Ctx", state: dict, item: dict, text: str) -> None:
+    """A decision made through a Slack thread: a `batch wait` that is alive returns it itself; otherwise the agent's
+    session gets it the way a `to_agent` instruction does (no `batch wait` → nobody would learn it)."""
+    origin = state.get("origin") or {}
+    if wait_alive(state["name"], ctx.clock()) or not origin.get("session_id") or origin.get("host") != socket.gethostname():
+        return
+    rec = {"id": item["id"], "n": item["n"], "round": item["round"], "text": text, "via": "slack:thread-decision",
+           "at": now_iso(), "delivered": None}
+    state.setdefault("deliveries", []).append(rec)
+    brief = (f"Владелец решил по пачке «{state.get('title', state['name'])}», элемент {item['id']}: {text}. "
+             f"Продолжай работу по этому решению (`batch show {state['name']}`).")
+    rec["delivered"] = deliver_to_session(ctx, state, rec, origin["session_id"], brief, f"delivery-{len(state['deliveries'])}")
+    journal(state, item, "delivery", via=rec["via"], text=text, delivered=rec["delivered"])
+    if rec["delivered"].startswith("failed:"):
+        report_delivery_failure(ctx, state, rec)
+    save_batch(state)
+
+
 def to_agent(ctx: "Ctx", state: dict, item: dict, text: str, via: str, chat=None, response: str | None = None) -> str:
     """«↩ Агенту»: the instruction of the owner (or of any recipient of the batch — `by` names who) goes to the agent
     that sent the batch, not to the corrector. A waiting `batch wait` wakes it (exit 7); nobody waiting and the
-    session on this host — `claude --bg --resume` continues it in its folder; otherwise it waits for the next `wait`."""
+    session on this host: its live process gets the text through `tmux send-keys`; no process — `claude --bg --resume` in
+    the session's project folder (not `origin.cwd`); otherwise it waits for the next `wait`. `delivered` is written by
+    fact (`failed:<reason>` + a Telegram line to the owner), see `deliver_to_session`."""
     chat = chat if chat is not None else ctx.chat_id
     duplicate = next((n for n in reversed(state.get("to_agent") or [])
                       if n.get("id") == item["id"] and n.get("round") == item["round"]
@@ -3359,10 +3537,13 @@ def to_agent(ctx: "Ctx", state: dict, item: dict, text: str, via: str, chat=None
         brief = (f"{who} ответил агенту по пачке «{state.get('title', state['name'])}», элемент {item['id']} "
                  f"(раунд {item['round']}): «{text}». Это указание к действию, а не правка текста: пересмотри и "
                  f"выполни, итог — ответом в той же пачке или `ask_owner.py notify`.")
-        note["hook"] = ctx.runner.start([CLAUDE_BIN, "--bg", "--resume", origin["session_id"], brief],
-                                        d / f"to_agent-{k}.log", d / f"to_agent-{k}.exit", cwd=origin.get("cwd"))
-        note["delivered"] = "resume"
-        reply = f"{item['id']} · Агент не ждал — продолжил его сессию в фоне ({origin['session_id'][:8]})."
+        note["delivered"] = deliver_to_session(ctx, state, note, origin["session_id"], brief, f"to_agent-{k}")
+        if note["delivered"].startswith("failed:"):
+            reply = f"{item['id']} · не доставил агенту: {note['delivered'][len('failed:'):]}"
+        elif note["delivered"].startswith("tmux:"):
+            reply = f"{item['id']} · Передал агенту — напечатал в его живую сессию ({note['delivered'][5:]})."
+        else:
+            reply = f"{item['id']} · Агент не ждал — продолжил его сессию в фоне ({origin['session_id'][:8]})."
     else:
         note["delivered"] = "pending"
         reply = f"{item['id']} · Указание записано: агент не ждёт, его сессия не на этом хосте — увидит при следующем wait."
@@ -3452,6 +3633,13 @@ def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
     than copy without slack_text_reason. An item without on_corrections gets the default corrector
     (DEFAULT_CORRECTOR: owner's text → corrected text → new round); an inline payload is written to a file for it.
     Copy mode without a working owner client raises CopyUnavailable — never a silent switch to bot-thread.
+
+    Delivery of the owner's text to the agent (`to_agent`, a decision made in a Slack thread): a live `batch wait`
+    gets it itself; otherwise the live process of `origin.session_id` (`~/.claude/sessions/<pid>.json`) is found in
+    tmux and the text is typed with `tmux send-keys` (`delivered: tmux:<pane>`); no live process — `claude --bg
+    --resume` in the project folder of the session (sessions file, else the transcript's `cwd`; never `origin.cwd`).
+    `delivered` is written by fact: `failed:<reason>` plus a Telegram line «не доставил агенту». The owner's replies
+    in the copy thread of a closed item are read 72 h after its last event and go to the agent as «после решения: …».
 
     Several people decide (the rules of ask_owner with .owner-decisions.json): spec "recipients": [{"chat_id": int,
     "name": "…"}] and optional "owner_name"; the owner (owner_chat_id of the bot config) is added first by itself
