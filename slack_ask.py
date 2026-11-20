@@ -2386,8 +2386,8 @@ def poll_slack(ctx: Ctx, state: dict, cache: dict | None = None) -> None:
             if not text.strip():
                 continue
             if item["status"] in TERMINAL:  # closed: the owner's word goes to the agent, status and choice stay
-                to_agent(ctx, state, item, f"после решения: {text}", "slack:after_decision", chat=ctx.chat_id)
-                state["to_agent"][-1]["after_decision"] = True
+                to_agent(ctx, state, item, f"после решения: {text}", "slack:after_decision", chat=ctx.chat_id,
+                         after_decision=True)
                 continue
             if item["status"] in OPEN and item.get("options") and item.get("options_text") != "corrections" \
                     and "?" in text and not text_choice(text, len(item["options"])):
@@ -3509,7 +3509,8 @@ def deliver_decision(ctx: "Ctx", state: dict, item: dict, text: str) -> None:
     save_batch(state)
 
 
-def to_agent(ctx: "Ctx", state: dict, item: dict, text: str, via: str, chat=None, response: str | None = None) -> str:
+def to_agent(ctx: "Ctx", state: dict, item: dict, text: str, via: str, chat=None, response: str | None = None,
+             after_decision: bool = False) -> str:
     """«↩ Агенту»: the instruction of the owner (or of any recipient of the batch — `by` names who) goes to the agent
     that sent the batch, not to the corrector. A waiting `batch wait` wakes it (exit 7); nobody waiting and the
     session on this host: its live process gets the text through `tmux send-keys`; no process — `claude --bg --resume` in
@@ -3522,7 +3523,7 @@ def to_agent(ctx: "Ctx", state: dict, item: dict, text: str, via: str, chat=None
     if duplicate:
         return f"{item['id']} · уже передал агенту"
     note = {"id": item["id"], "n": item["n"], "round": item["round"], "text": text, "via": via, "at": now_iso(),
-            "delivered": None}
+            "delivered": None, **({"after_decision": True} if after_decision else {})}
     if is_multi(state):
         note["by"], note["chat"] = person_name(ctx, state, chat), chat
     state.setdefault("to_agent", []).append(note)

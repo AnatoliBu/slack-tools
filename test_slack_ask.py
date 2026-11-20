@@ -991,3 +991,93 @@ def test_thread_decision_not_delivered_when_wait_alive(env, agent):
     env.ws.post(OWNER, "DSELF", "1", thread_ts=copy_ts)
     sa.poll_slack_batches(c, {st["name"]: st})
     assert st["items"][0]["choice"] == 1 and not st.get("deliveries") and runner.starts == []
+
+
+# --- acceptance r1: the remaining branches --------------------------------------------------------------
+
+def test_live_process_outside_tmux_is_failed_not_resumed_and_owner_is_told(env, agent):
+    agent.session_file(5001)
+    runner = FakeRunner(panes="900 %9\n", parents={5001: 1})  # no ancestor of the process is a pane
+    c, st = agent.make("r1-notmux", runner)
+    reply = _ask(c, st)
+    assert st["to_agent"][-1]["delivered"].startswith("failed:") and "не в tmux" in st["to_agent"][-1]["delivered"]
+    assert runner.starts == [] and not [r for r in runner.runs if r[:2] == ["tmux", "send-keys"]]
+    assert "не доставил агенту" in reply
+    assert any(m == "sendMessage" and "не доставил агенту" in p.get("text", "") for m, p in env.tg.calls)
+
+
+def test_no_process_and_no_cwd_is_failed(env, agent):
+    agent.session_file(5002, cwd=None, live=False)  # sessions file without cwd, no transcript
+    runner = FakeRunner()
+    c, st = agent.make("r1-nocwd", runner)
+    _ask(c, st)
+    assert st["to_agent"][-1]["delivered"].startswith("failed:каталог проекта")
+    assert runner.starts == []
+
+
+def test_resume_start_oserror_is_failed(env, agent):
+    agent.session_file(5003, live=False)
+
+    class Boom(FakeRunner):
+        def start(self, argv, log, exit_file, cwd=None):
+            raise OSError("cwd gone")
+
+    c, st = agent.make("r1-oserror", Boom())
+    _ask(c, st)
+    assert st["to_agent"][-1]["delivered"] == "failed:resume не запустился: cwd gone"
+
+
+def test_thread_decision_of_session_on_another_host_is_not_delivered(env, agent):
+    agent.session_file(5004, live=False)
+    runner = FakeRunner()
+    c, st = agent.make("r1-host", runner)
+    st["origin"]["host"] = "other-host"
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "2", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {st["name"]: st})
+    assert st["items"][0]["choice"] == 2
+    assert not st.get("deliveries") and runner.starts == [] and runner.runs == []
+
+
+def test_thread_decision_delivery_failure_tells_the_owner(env, agent):
+    agent.session_file(5005, cwd=None, live=False)  # nowhere to resume
+    c, st = agent.make("r1-decfail", FakeRunner())
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "1", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {st["name"]: st})
+    [rec] = st["deliveries"]
+    assert rec["delivered"].startswith("failed:")
+    told = [p["text"] for m, p in env.tg.calls if m == "sendMessage" and "не доставил агенту" in p.get("text", "")]
+    assert len(told) == 1
+
+
+def test_in_after_window_takes_only_terminal_items(env, agent):
+    c, st = agent.make("r1-window", FakeRunner())
+    item = st["items"][0]
+    sa.journal(st, item, "pending", via="test")  # a fresh `last` on an open item
+    assert item["status"] in sa.OPEN and not sa.in_after_window(c, item)
+    item["status"] = "expired"
+    assert sa.in_after_window(c, item)
+
+
+def test_open_item_thread_is_read_once_per_poll(env, agent):
+    c, st = agent.make("r1-once", FakeRunner())
+    item = st["items"][0]
+    sa.journal(st, item, "pending", via="test")
+    calls = []
+    real = c.usr.conversations_replies
+    c.usr.conversations_replies = lambda **kw: (calls.append(kw), real(**kw))[1]
+    copy_ts = item["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "что именно?", thread_ts=copy_ts)
+    sa.poll_slack(c, st)
+    assert len(calls) == 1
+
+
+def test_after_decision_flag_is_saved_and_duplicate_does_not_mark_foreign_note(env, agent):
+    c, st = agent.make("r1-flag", FakeRunner())
+    item = st["items"][0]
+    sa.to_agent(c, st, item, "после решения: да", "slack:after_decision", after_decision=True)
+    assert sa.load_batch("r1-flag")["to_agent"][-1]["after_decision"] is True
+    sa.to_agent(c, st, item, "ответ", "telegram:to_agent")
+    sa.to_agent(c, st, item, "после решения: да", "slack:after_decision", after_decision=True)  # duplicate
+    assert "after_decision" not in st["to_agent"][1] and len(st["to_agent"]) == 2
