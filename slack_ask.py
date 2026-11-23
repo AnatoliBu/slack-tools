@@ -383,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
 
 WORKSPACE = "https://loyaltyplant.slack.com"
 APPROVAL_MAX_AGE_S = 24 * 3600
+PAYLOAD_MAX_CHARS = 40_000   # payload of one card; beyond it the item must say allow_long_payload (owner 2026-11-23)
 
 
 def permalink(ch: str, ts: str) -> str:
@@ -1076,8 +1077,21 @@ def prefill_problems(items: list[dict], people: list[dict]) -> list[str]:
 def item_line(state: dict, item: dict) -> str:
     """First line of every message of the item — the id leads (owner's decision 2026-10-13)."""
     total, r = len(state["items"]), item["round"]
-    tags = ([f"{item['n']}/{total}"] if total > 1 else []) + ([f"раунд {r}"] if r > 1 else [])
-    return f"{item['id']} · {item['labels']['title']}" + (f" ({', '.join(tags)})" if tags else "")
+    count = f" {item['n']}/{total}" if total > 1 else ""
+    # Владелец 20.11: статус и номер в пачке видны в заголовке — ❓ ждёт решения, ✅ решено (см. closed_mark).
+    return f"{item['id']} · ❓{count} · {item['labels']['title']}" + (f" (раунд {r})" if r > 1 else "")
+
+
+CLOSED_MARK = {"done": "✅", "instructed": "✅", "approving": "✅", "waiting_after": "✅", "rejected": "❌",
+               "cancelled": "✖", "expired": "⌛", "commented": "✍", "correcting": "✍"}
+
+
+def closed_header(state: dict | None, item: dict) -> str:
+    """Заголовок закрытой карточки: «ID · ✅ n/N · заголовок» — тот же формат, что item_line, со знаком исхода."""
+    title = (item.get("labels") or {}).get("title") or item.get("title") or ""
+    total = len((state or {}).get("items") or [])
+    count = f" {item['n']}/{total}" if total > 1 and item.get("n") else ""
+    return f"{item['id']} · {CLOSED_MARK.get(item.get('status', ''), '✅')}{count} · {title}".strip(" ·")
 
 
 def section(text: str) -> dict:
@@ -1344,8 +1358,7 @@ def disarm(ctx: Ctx, item: dict, state: dict | None = None, summary: str | None 
     if not item.get("rounds"):
         return
     outcome_line = _closed_summary(item, summary)
-    title = (item.get("labels") or {}).get("title") or item.get("title") or ""
-    header = f"{item['id']} · {title}".strip(" ·")
+    header = closed_header(state, item)
     if ctx.tg:
         tg_text = f"<b>{html.escape(header)}</b>\n{html.escape(outcome_line)}"
         for rnd in item["rounds"]:
@@ -1370,6 +1383,13 @@ def disarm(ctx: Ctx, item: dict, state: dict | None = None, summary: str | None 
                             unfurl_links=False, unfurl_media=False)
         except Exception as err:
             warn(f"{item['id']}: Slack card update skipped: {err}")
+    usr, copy_ch = getattr(ctx, "usr", None), (state or {}).get("copy_channel")
+    if usr is not None and copy_ch and cur_slack.get("copy_ts"):  # владелец читает копию в своей личке — ей тоже итог
+        try:
+            usr.chat_update(channel=copy_ch, ts=cur_slack["copy_ts"], unfurl_links=False,
+                            text=f"{header} · {outcome_line}\n{item.get('detail', '')}".rstrip())
+        except Exception as err:
+            warn(f"{item['id']}: owner copy header not updated: {err}")
 
 
 def ensure_slack_mirror(ctx: Ctx, state: dict, item: dict) -> str | None:
@@ -3594,6 +3614,17 @@ def item_spec_problems(it: dict) -> list[str]:
         problems.append(f"{name}: no payload / payload_file")
     elif it.get("payload_file") and not Path(it["payload_file"]).is_file():
         problems.append(f"{name}: payload_file not found: {it['payload_file']}")
+    # 2026-11-23: a 322 KB payload_file became 81 Telegram and 66 Slack messages for one card (owner: «почему вместо этой
+    # одной карточки я получаю 88 сообщений?»). A long payload is refused unless the item says it is meant to be long.
+    if not problems and not it.get("allow_long_payload"):
+        try:
+            size = len(Path(it["payload_file"]).read_text(encoding="utf-8", errors="replace")) if it.get("payload_file") \
+                else len(str(it.get("payload") or ""))
+        except OSError:
+            size = 0
+        if size > PAYLOAD_MAX_CHARS:
+            problems.append(f"{name}: payload {size} знаков > {PAYLOAD_MAX_CHARS} — уйдёт примерно {size // 3500 + 1} сообщениями; "
+                            "дай выжимку, а путь к полному файлу назови в тексте (осознанно длинный — allow_long_payload: true)")
     options = it.get("options")
     if options is not None and (not isinstance(options, list) or not 2 <= len(options) <= 9 or
                                 any(not isinstance(o, str) or not o.strip() for o in options)):
@@ -3823,13 +3854,17 @@ def cancel_telegram():
     return ao.http_call(cfg["token"]), cfg["owner_chat_id"]
 
 
-def batch_cancel(state: dict, ids: list[str] | None, reason: str = CANCEL_REASON, tg=None, chat_id=None) -> list[dict]:
+def batch_cancel(state: dict, ids: list[str] | None, reason: str = CANCEL_REASON, tg=None, chat_id=None,
+                 ctx: "Ctx | None" = None) -> list[dict]:
     """Take items off the wait AND off the phones (2026-10-27: «у меня всё ещё есть кнопки у снятых» — cancel changed the
     status only): every Telegram card of the item in every recipient's chat (round card, disagreement cards; the owner
     alone — the old fields) loses its keyboard, and each recipient gets «<id> · снято: <reason>» as a reply to his
-    card. Telegram errors (not modified, message to edit not found) are cosmetic."""
+    card. Telegram errors (not modified, message to edit not found) are cosmetic.
+    With `ctx` (the CLI passes the full one) the Slack card header is redrawn as «✖» too: without it the owner keeps
+    seeing «❓ n/N» on a card taken off the vote (2026-11-23)."""
     reason = reason or CANCEL_REASON
-    ctx = tg_only_ctx(tg, chat_id)  # no Slack client is needed to take buttons away
+    ctx = ctx or tg_only_ctx(tg, chat_id)
+    tg = tg or getattr(ctx, "tg", None)
     done = []
     for item in state["items"]:
         if item["status"] not in OPEN + ("new",) or (ids and item["id"] not in ids):
@@ -3838,10 +3873,10 @@ def batch_cancel(state: dict, ids: list[str] | None, reason: str = CANCEL_REASON
         close_item_prompts(ctx, state, item, f"снято: {reason}")
         journal(state, item, "cancelled", via="cli", reason=reason)
         done.append(item)
-        if not tg or not item["rounds"]:
+        if not item["rounds"] or not (tg or getattr(ctx, "bot", None)):
             continue
         disarm(ctx, item, state, summary=f"✖ Снято: {reason}")
-        for person in recipients_of(ctx, state):
+        for person in (recipients_of(ctx, state) if tg else []):
             card = latest_card(ctx, item, person["chat_id"])
             reply = {"reply_to_message_id": card, "allow_sending_without_reply": True} if card else {}
             _ask_owner().cosmetic(tg, "sendMessage", chat_id=person["chat_id"], text=f"{item['id']} · снято: {reason}",
@@ -4114,7 +4149,7 @@ def tg_only_ctx(tg, chat_id) -> Ctx:
 
 
 def batch_resolve(state: dict, item_id: str, same: str | None = None, dispute: bool = False, tg=None,
-                  chat_id=None, instructed: str | None = None) -> str:
+                  chat_id=None, instructed: str | None = None, ctx: "Ctx | None" = None) -> str:
     """The agent's verdict on an item in `review` (own texts that differ in letter): --same "<wording>" — decided,
     `by` all names, via agent-review, everyone gets «✔ Решено: <wording> (names)» and the cards close; --dispute — the
     usual «Расхождение» card to everyone. ValueError when the item is not under review."""
@@ -4128,7 +4163,8 @@ def batch_resolve(state: dict, item_id: str, same: str | None = None, dispute: b
             raise ValueError("--instructed needs a summary or a saved owner instruction")
         item["status"], item["result"] = "instructed", wording
         journal(state, item, "instructed", via="cli", text=wording)
-        ctx = tg_only_ctx(tg, chat_id)
+        ctx = ctx or tg_only_ctx(tg, chat_id)
+        tg = tg or getattr(ctx, "tg", None)
         disarm(ctx, item, state, summary=f"✔ По указанию: {wording}")
         if tg and item["rounds"]:
             for person in recipients_of(ctx, state):
@@ -4143,7 +4179,7 @@ def batch_resolve(state: dict, item_id: str, same: str | None = None, dispute: b
                          "resolve only answers `wait`'s REVIEW")
     if same is not None and not same.strip():
         raise ValueError("--same needs the wording of the decision")
-    ctx = tg_only_ctx(tg, chat_id)
+    ctx = ctx or tg_only_ctx(tg, chat_id)
     answers = item.get("answers") or {}
     names = ", ".join(answers[str(p["chat_id"])]["by"] for p in recipients_of(ctx, state) if str(p["chat_id"]) in answers)
     if dispute:
@@ -4339,6 +4375,20 @@ def make_ctx(a, telegram: bool = True) -> Ctx:
     return ctx
 
 
+def closing_ctx(a) -> "Ctx | None":
+    """Full Ctx for `cancel` / `resolve`: the Slack card header is redrawn together with the Telegram card. None when
+    Slack cannot be reached — the caller then closes the Telegram side only, as before."""
+    import types
+    ns = types.SimpleNamespace(owner=getattr(a, "owner", None) or os.environ.get("SLACK_ASK_OWNER", "U034A9RE6RF"),
+                               origin=getattr(a, "origin", None) or os.environ.get("SLACK_ASK_ORIGIN", socket.gethostname()),
+                               slack_text=None)
+    try:
+        return make_ctx(ns, telegram=not getattr(a, "no_telegram", False))
+    except (SystemExit, Exception) as err:
+        warn(f"Slack is not reachable ({err}) — only the Telegram cards are closed, the Slack header stays")
+        return None
+
+
 def edit_changes(a) -> dict:
     """The fields of `batch edit` from --spec and the flags (flags win). ValueError on a malformed spec."""
     changes: dict = {}
@@ -4447,7 +4497,7 @@ def batch_cli(argv: list[str]) -> int:
         tg, chat_id = (None, None) if a.no_telegram else cancel_telegram()
         try:
             print(batch_resolve(state, a.item, same=a.same, dispute=a.dispute, tg=tg, chat_id=chat_id,
-                                instructed=a.instructed))
+                                instructed=a.instructed, ctx=closing_ctx(a)))
         except ValueError as err:
             print(f"slack-ask batch resolve: {err}", file=sys.stderr)
             return 2
@@ -4489,7 +4539,7 @@ def batch_cli(argv: list[str]) -> int:
     if a.cmd == "cancel":
         state = load_batch(a.batch)
         tg, chat_id = (None, None) if a.no_telegram else cancel_telegram()
-        batch_cancel(state, a.item, a.reason, tg=tg, chat_id=chat_id)
+        batch_cancel(state, a.item, a.reason, tg=tg, chat_id=chat_id, ctx=closing_ctx(a))
         print(batch_show(state))
         return 0
     try:

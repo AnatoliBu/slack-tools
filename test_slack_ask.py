@@ -512,6 +512,29 @@ def _sent_for_edit(env, name="b-edit"):
     return c, st["key"], rnd["slack"]["ts"], rnd["telegram"]["card_id"]
 
 
+def test_cancel_with_slack_ctx_redraws_the_slack_card_header_as_cancelled(env):
+    """Владелец 23.11: «всё ещё вижу карточку» — cancel закрывал только Telegram, шапка в Slack оставалась «❓»."""
+    c, _key, ts, _card = _sent_for_edit(env)
+    updates0 = len(env.ws.chat_updates)
+
+    sa.batch_cancel(sa.load_batch("b-edit"), ["TASK-201"], "повтор", ctx=c)
+
+    mine = [u for u in env.ws.chat_updates[updates0:] if u[1] == ts]
+    assert mine, "Slack root card was not redrawn by cancel"
+    assert "✖" in mine[-1][2] and "❓" not in mine[-1][2] and "повтор" in mine[-1][2]
+
+
+def test_resolve_instructed_with_slack_ctx_redraws_the_slack_card_header_as_decided(env):
+    c, _key, ts, _card = _sent_for_edit(env)
+    updates0 = len(env.ws.chat_updates)
+
+    sa.batch_resolve(sa.load_batch("b-edit"), "TASK-201", instructed="сделано по указанию", ctx=c)
+
+    mine = [u for u in env.ws.chat_updates[updates0:] if u[1] == ts]
+    assert mine, "Slack root card was not redrawn by resolve --instructed"
+    assert "✅" in mine[-1][2] and "❓" not in mine[-1][2]
+
+
 def _api_calls(env) -> int:
     return len(env.tg.calls) + len(env.ws.chat_updates) + sum(len(v) for v in env.ws.messages.values())
 
