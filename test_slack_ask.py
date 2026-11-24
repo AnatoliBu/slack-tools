@@ -1267,3 +1267,80 @@ def test_yesno_approve_only_text_without_question_is_still_a_comment(env):
     env.ws.post(OWNER, "DSELF", "поправь формулировку", thread_ts=copy_ts)
     sa.poll_slack_batches(c, {"r-nq": st})
     assert st["items"][0]["status"] == "commented" and not st.get("to_agent")
+
+
+# --- оформление ответа агента: разделы, divider, заголовки (пункт 4) -----------------------------------------
+
+PING = pathlib.Path(__file__).parent / "fixtures" / "ping-hg1.md"
+
+
+def _kinds(blocks):
+    return [b["type"] for b in blocks]
+
+
+def test_parse_reply_sections_ping_sample_splits_headings_from_bodies():
+    sections = sa.parse_reply_sections(PING.read_text(encoding="utf-8"))
+    heads = [h for h, _ in sections]
+    assert heads[0] is None and heads[1] == "⚔️ КОНФЛИКТ ТРЕБОВАНИЙ" and heads[2].startswith("🔗 ЦЕПОЧКА ПО ФАКТУ")
+    assert "🔍 ПОХОЖИЕ СИТУАЦИИ — КАК СЕЙЧАС" in heads and sections[1][1].startswith("• HEALTH-02")
+    assert len(sections) == 6
+
+
+def test_slack_reply_blocks_have_divider_between_sections_and_bold_heading_apart_from_body():
+    blocks = sa.reply_blocks_for_slack("EPROD-1", PING.read_text(encoding="utf-8"))
+    assert len(blocks) == 1 and 3 <= len(blocks[0]) <= 50
+    kinds = _kinds(blocks[0])
+    assert kinds.count("divider") >= 4 and kinds[0] != "divider" and kinds[-1] != "divider"
+    texts = [b["text"]["text"] for b in blocks[0] if b["type"] == "section"]
+    assert "*⚔️ КОНФЛИКТ ТРЕБОВАНИЙ*" in texts
+    assert next(t for t in texts if t.startswith("• HEALTH-02"))
+    assert all(len(t) <= 3000 for t in texts)
+
+
+def test_slack_reply_over_limits_is_split_into_numbered_messages():
+    text = "\n\n".join(f"Раздел {i}\nстрока" for i in range(60))
+    parts = sa.reply_blocks_for_slack("X-1", text)
+    assert len(parts) > 1 and all(len(p) <= 50 for p in parts)
+    assert "1/%d" % len(parts) in parts[0][0]["text"]["text"]
+    big = sa.reply_blocks_for_slack("X-1", "\n".join("я" * 100 for _ in range(8)) * 1 + "\n\n" + "\n".join("ю" * 2000 for _ in range(3)))
+    assert all(len(b["text"]["text"]) <= 3000 for p in big for b in p if b["type"] == "section")
+
+
+def test_batch_reply_posts_blocks_with_plain_fallback_to_the_copy_thread(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _yesno_spec(), "r-blocks")
+    rnd = st["items"][0]["rounds"][0]
+    sa.batch_reply(st, "PLAT-3198", PING.read_text(encoding="utf-8"), tg=env.tg, chat_id=TG_OWNER, ctx=c)
+    posted = [m for m in env.ws.thread("DSELF", rnd["slack"]["copy_ts"]) if m["ts"] != rnd["slack"]["copy_ts"] and m["blocks"]]
+    assert posted and "divider" in _kinds(posted[0]["blocks"]) and "КОНФЛИКТ" in posted[0]["text"]
+
+
+def test_telegram_reply_has_separator_and_bold_heading_line():
+    parts = sa.reply_html_for_telegram("X-1", PING.read_text(encoding="utf-8"))
+    html_text = "\n".join(parts)
+    assert "\n\n———\n\n<b>⚔️ КОНФЛИКТ ТРЕБОВАНИЙ</b>\n• HEALTH-02" in html_text
+    assert html_text.count("———") >= 4
+
+
+def test_wall_of_twelve_lines_is_refused_with_hint(env):
+    wall = "\n".join(f"строка {i}" for i in range(12))
+    with pytest.raises(sa.ReplyFormatError) as err:
+        sa.parse_reply_sections(wall)
+    assert "12" in str(err.value) and "пустой строкой" in str(err.value)
+
+
+def test_heading_without_body_is_refused():
+    with pytest.raises(sa.ReplyFormatError):
+        sa.parse_reply_sections("🔗 ЦЕПОЧКА\n🔍 ПОХОЖИЕ\n• да")
+
+
+def test_cli_batch_reply_exit_6_without_sending(env, monkeypatch, capsys):
+    c = env.ctx()
+    sa.batch_send(c, _yesno_spec(), "r-exit6")
+    monkeypatch.setattr(sa, "cancel_telegram", lambda: (env.tg, TG_OWNER))
+    monkeypatch.setattr(sa, "closing_ctx", lambda a: c)
+    sent_before = len(env.tg.calls) + sum(len(v) for v in env.ws.messages.values())
+    wall = "\n".join(f"строка {i}" for i in range(12))
+    code = sa.batch_cli(["reply", "--batch", "r-exit6", "--item", "PLAT-3198", "--text", wall])
+    assert code == 6 and "пустой строкой" in capsys.readouterr().err
+    assert len(env.tg.calls) + sum(len(v) for v in env.ws.messages.values()) == sent_before

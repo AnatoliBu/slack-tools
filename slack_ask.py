@@ -3587,11 +3587,159 @@ def to_agent(ctx: "Ctx", state: dict, item: dict, text: str, via: str, chat=None
     return reply
 
 
+class ReplyFormatError(ValueError):
+    """The agent's reply is a wall of text: `batch reply` refuses it (exit 6) and nothing is sent."""
+
+
+REPLY_SECTION_MAX_LINES = 8
+REPLY_SLACK_BLOCKS = 48      # Block Kit takes 50 blocks per message; two stay in reserve (id line)
+REPLY_SLACK_SECTION = 3000   # Block Kit: text of a section block
+REPLY_SEPARATOR = "———"
+_KEYCAP = re.compile(r"^\s*(?:\d\ufe0f?\u20e3|[❌✅⚠️])")
+
+
+def _is_reply_heading(line: str) -> bool:
+    """A section title line: a whole `*bold*` line, or emoji + CAPITALS (the part before the first «(» has no
+    lowercase letter: «🔗 ЦЕПОЧКА ПО ФАКТУ (test6, …)»)."""
+    line = line.strip()
+    if re.fullmatch(r"\*[^*\n]+\*", line):
+        return True
+    letters = [ch for ch in line.split("(")[0] if ch.isalpha()]
+    return len(letters) >= 3 and all(ch.isupper() for ch in letters)
+
+
+def _top_level_lines(lines: list[str]) -> int:
+    """Lines of a section as the reader counts them: «•» / «-» sub-points under a numbered step belong to the step."""
+    count, under_step = 0, False
+    for line in lines:
+        if _KEYCAP.match(line):
+            under_step = True
+        elif under_step and line.lstrip().startswith(("•", "-", "–")):
+            continue
+        else:
+            under_step = False
+        count += 1
+    return count
+
+
+def parse_reply_sections(text: str) -> list[tuple[str | None, str]]:
+    """The agent's reply as [(heading or None, body)]: sections are the parts between blank lines; the first line of
+    a part that is a heading (see `_is_reply_heading`) and has a body below it is split off, a heading alone in its
+    part takes the next part as its body. ReplyFormatError: a section of more than 8 lines without a blank line,
+    a heading with no body (directly followed by another heading, or last)."""
+    parts = [[ln.rstrip() for ln in block.strip("\n").split("\n")] for block in re.split(r"\n[ \t]*\n", text.strip())
+             if block.strip()]
+    sections: list[tuple[str | None, str]] = []
+    pending: str | None = None
+    for lines in parts:
+        heading = None
+        if len(lines) > 1 and _is_reply_heading(lines[0]):
+            heading, lines = lines[0], lines[1:]
+            if _is_reply_heading(lines[0]):
+                raise ReplyFormatError(f"заголовок «{heading.strip()}» идёт сразу перед заголовком «{lines[0].strip()}» — "
+                                       "у раздела нет тела; отдели заголовок от тела или удали его")
+        elif len(lines) == 1 and _is_reply_heading(lines[0]):
+            if pending is not None:
+                raise ReplyFormatError(f"заголовок «{pending.strip()}» без тела: следом сразу идёт другой заголовок")
+            pending = lines[0]
+            continue
+        if pending is not None:
+            if heading is not None:
+                raise ReplyFormatError(f"заголовок «{pending.strip()}» без тела: следом сразу идёт другой заголовок")
+            heading, pending = pending, None
+        n = _top_level_lines(lines)
+        if n > REPLY_SECTION_MAX_LINES:
+            raise ReplyFormatError(
+                f"раздел «{(heading or lines[0]).strip()[:60]}» — {n} строк подряд без пустой строки (максимум "
+                f"{REPLY_SECTION_MAX_LINES}): раздели его пустой строкой на смысловые части")
+        sections.append((heading.strip() if heading else None, "\n".join(lines)))
+    if pending is not None:
+        raise ReplyFormatError(f"заголовок «{pending.strip()}» последний, под ним ничего нет")
+    return sections
+
+
+def _split_body(body: str, limit: int) -> list[str]:
+    out, cur = [], ""
+    for line in body.split("\n"):
+        while len(line) > limit:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(line[:limit])
+            line = line[limit:]
+        if cur and len(cur) + 1 + len(line) > limit:
+            out.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    return out + ([cur] if cur else [])
+
+
+def _bold(heading: str) -> str:
+    inner = heading.strip()
+    if re.fullmatch(r"\*[^*\n]+\*", inner):
+        inner = inner[1:-1]
+    return f"*{inner}*"
+
+
+def reply_blocks_for_slack(item_id: str, text: str) -> list[list[dict]]:
+    """Block Kit of the agent's reply, one list of blocks per message: the id line, then every section as a bold
+    heading block + body block(s), a `divider` between sections. More than 50 blocks / 3000 characters: several
+    messages, the id line says «1/N»."""
+    sections = parse_reply_sections(text)
+    units: list[list[dict]] = []  # blocks of one section
+    for heading, body in sections:
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": _bold(heading)}}] if heading else []
+        blocks += [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}}
+                   for chunk in _split_body(body, REPLY_SLACK_SECTION)]
+        units.append(blocks)
+    messages: list[list[dict]] = [[]]
+    for blocks in units:
+        used = len(messages[-1]) + (1 if messages[-1] else 0)
+        if messages[-1] and used + len(blocks) > REPLY_SLACK_BLOCKS:
+            messages.append([])
+        if messages[-1]:
+            messages[-1].append({"type": "divider"})
+        messages[-1] += blocks
+    total = len(messages)
+    out = []
+    for k, blocks in enumerate(messages, 1):
+        head = f"{item_id} · {k}/{total}" if total > 1 else f"{item_id} ·"
+        out.append([{"type": "section", "text": {"type": "mrkdwn", "text": head}}] + blocks)
+    return out
+
+
+def reply_html_for_telegram(item_id: str, text: str) -> list[str]:
+    """The reply for Telegram (parse_mode HTML): sections apart by a blank line and «———», the heading on its own
+    bold line; several messages when it does not fit 4096."""
+    esc = html.escape
+    room = TG_LIMIT - 200
+    units: list[str] = []
+    for heading, body in parse_reply_sections(text):
+        for k, chunk in enumerate(_split_body(body, room // 3)):
+            units.append((f"<b>{esc(heading)}</b>\n" if heading and k == 0 else "") + esc(chunk))
+    sep = f"\n\n{REPLY_SEPARATOR}\n\n"
+    messages, cur = [], f"{esc(item_id)} ·"
+    for unit in units:
+        if len(cur) + len(sep) + len(unit) > room:
+            messages.append(cur)
+            cur = unit
+        else:
+            cur += sep + unit
+    return messages + [cur]
+
+
+def plain_reply(item_id: str, text: str) -> str:
+    return f"{item_id} · {text.strip()}"
+
+
 def batch_reply(state: dict, item_id: str, text: str, tg=None, chat_id=None, ctx: "Ctx | None" = None) -> list[int]:
     """Send an agent clarification where the owner waits for it: the thread of the Slack copy of the card (no copy —
     the thread of the bot's card) and, as a reply to each recipient's current-round card, Telegram. Either channel
     alone is enough: no Telegram — Slack still goes. The Slack ts is kept in `agent_reply_ids` and in `seen` of the
-    round, so the watch never reads the agent's own line (it stands in the owner's DM under the owner's user)."""
+    round, so the watch never reads the agent's own line (it stands in the owner's DM under the owner's user).
+    The text is laid out by sections (`parse_reply_sections`): a wall of text is refused with ReplyFormatError
+    before anything is sent."""
     item = next((it for it in state["items"] if it["id"] == item_id), None)
     if item is None or not item.get("rounds"):
         raise ValueError(f"{item_id}: no current round")
@@ -3602,10 +3750,12 @@ def batch_reply(state: dict, item_id: str, text: str, tg=None, chat_id=None, ctx
         tg, chat_id = getattr(ctx, "tg", None), getattr(ctx, "chat_id", None)
     if tg is None and not slack_ok:
         raise ValueError("neither Telegram nor Slack is configured")
+    slack_messages = reply_blocks_for_slack(item_id, text)   # raises ReplyFormatError before any send
+    tg_messages = reply_html_for_telegram(item_id, text)
     round_ = item["rounds"][-1]
-    sent, slack_ts = [], None
+    sent, slack_ts = [], []
     if slack_ok:
-        slack_ts = post_agent_reply_to_slack(ctx, state, item, round_, f"{item_id} · {text.strip()}")
+        slack_ts = post_agent_reply_to_slack(ctx, state, item, round_, slack_messages, plain_reply(item_id, text))
     if tg is not None:
         tctx = tg_only_ctx(tg, chat_id)
         for person in recipients_of(tctx, state):
@@ -3614,40 +3764,46 @@ def batch_reply(state: dict, item_id: str, text: str, tg=None, chat_id=None, ctx
             cards = tg_cards(tctx, telegram).get(int(chat)) or {}
             card = cards.get("card_id")
             reply_to = {"reply_to_message_id": card, "allow_sending_without_reply": True} if card else {}
-            mid = tg_send(tctx, chat_id=chat, text=f"{item_id} · {text.strip()}", **reply_to)
-            if telegram.get("chats"):
-                telegram["chats"].setdefault(str(chat), cards).setdefault("extra_ids", []).append(mid)
-            else:
-                telegram.setdefault("extra_ids", []).append(mid)
-            round_.setdefault("agent_reply_ids", []).append({"chat_id": int(chat), "message_id": mid,
-                                                               "sent_at": now_iso()})
-            sent.append(mid)
+            for body in tg_messages:
+                mid = tg_send(tctx, chat_id=chat, text=body, parse_mode="HTML", **reply_to)
+                if telegram.get("chats"):
+                    telegram["chats"].setdefault(str(chat), cards).setdefault("extra_ids", []).append(mid)
+                else:
+                    telegram.setdefault("extra_ids", []).append(mid)
+                round_.setdefault("agent_reply_ids", []).append({"chat_id": int(chat), "message_id": mid,
+                                                                   "sent_at": now_iso()})
+                sent.append(mid)
     journal(state, item, "agent_reply", via="cli", text=text.strip(), message_ids=sent,
-            **({"slack_ts": slack_ts} if slack_ts else {}))
+            **({"slack_ts": slack_ts[0]} if slack_ts else {}), **({"slack_ts_all": slack_ts} if len(slack_ts) > 1 else {}))
     save_batch(state)
     return sent
 
 
-def post_agent_reply_to_slack(ctx: "Ctx", state: dict, item: dict, round_: dict, text: str) -> str | None:
-    """The agent's line into the Slack thread of the round: the owner's copy (posted under the owner's token — the
-    channel is the owner's DM), without a copy the bot's card thread. A Slack failure is a warning: Telegram still goes."""
+def post_agent_reply_to_slack(ctx: "Ctx", state: dict, item: dict, round_: dict, messages: list[list[dict]],
+                              fallback: str) -> list[str]:
+    """The agent's blocks into the Slack thread of the round: the owner's copy (posted under the owner's token — the
+    channel is the owner's DM), without a copy the bot's card thread. `fallback` is the notification text. A Slack
+    failure is a warning: Telegram still goes."""
     s = round_["slack"]
     if s.get("copy_ts") and getattr(ctx, "usr", None) is not None and state.get("copy_channel"):
         client, channel, thread_ts = ctx.usr, state["copy_channel"], s["copy_ts"]
     elif s.get("ts") and state.get("slack_channel"):
         client, channel, thread_ts = ctx.bot, state["slack_channel"], s["ts"]
     else:
-        return None
-    try:
-        ts = str(client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text,
-                                         unfurl_links=False, unfurl_media=False)["ts"])
-    except Exception as err:
-        warn(f"agent reply to Slack failed: {err}")
-        return None
-    s.setdefault("seen", []).append(ts)  # the agent's own ts: never an owner text
-    round_.setdefault("agent_reply_ids", []).append({"slack_ts": ts, "channel": channel, "thread_ts": thread_ts,
-                                                       "sent_at": now_iso()})
-    return ts
+        return []
+    out = []
+    for blocks in messages:
+        try:
+            ts = str(client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=fallback[:3000], blocks=blocks,
+                                             unfurl_links=False, unfurl_media=False)["ts"])
+        except Exception as err:
+            warn(f"agent reply to Slack failed: {err}")
+            break
+        s.setdefault("seen", []).append(ts)  # the agent's own ts: never an owner text
+        round_.setdefault("agent_reply_ids", []).append({"slack_ts": ts, "channel": channel, "thread_ts": thread_ts,
+                                                           "sent_at": now_iso()})
+        out.append(ts)
+    return out
 
 
 def item_spec_problems(it: dict) -> list[str]:
@@ -4531,6 +4687,9 @@ def batch_cli(argv: list[str]) -> int:
             message = a.text if a.text is not None else a.file.read_text(encoding="utf-8")
             tg, chat_id = (None, None) if a.no_telegram else cancel_telegram()
             batch_reply(state, a.item, message, tg=tg, chat_id=chat_id, ctx=closing_ctx(a))
+        except ReplyFormatError as err:
+            print(f"slack-ask batch reply: {err}", file=sys.stderr)
+            return 6
         except (OSError, ValueError) as err:
             print(f"slack-ask batch reply: {err}", file=sys.stderr)
             return 2
