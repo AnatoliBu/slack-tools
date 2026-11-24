@@ -17,8 +17,6 @@
     (хост, сессия) — мелко в конце (решение владельца 2026-10-13: «все начинаются одинаково — путаюсь»).
 
 Токены: бот — SLACK_BOT_TOKEN из ~/.config/lp-agent/slack-bot.env; пользователь — SLACK_XOXC/SLACK_XOXD из .env рядом.
-Без SLACK_BOT_TOKEN (канал freelance на gaydns) при наличии Telegram-конфига движок работает в telegram-only без Slack: все команды, кнопки,
-хуки, recipients и --notify — через Telegram; явный --channels со Slack — отказ без отправки (exit 1; в spec — exit 6).
 
 Выход: stdout key=value (или --json); exit 0 — ответ получен, 3 — таймаут, 2 — ошибка аргументов/Slack.
   slack-ask "Залить PLAT-4802 на test6? Последняя заливка 40 мин назад: a.ivanov, do-menu" --yesno
@@ -57,12 +55,7 @@ import time
 import unicodedata
 from pathlib import Path
 
-
-def WebClient(**kwargs):
-    """slack_sdk's WebClient, imported on first use: a run without Slack (the freelance channel) needs no slack_sdk."""
-    from slack_sdk import WebClient as client
-    return client(**kwargs)
-
+from slack_sdk import WebClient
 
 HERE = Path(__file__).resolve().parent
 NUM = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
@@ -289,23 +282,11 @@ def main(argv: list[str] | None = None) -> int:
         if a.timeout < minimum:
             print(f"slack-ask: --timeout {a.timeout} < минимума {minimum} — жду {minimum} с", file=sys.stderr)
             a.timeout = minimum
-    escalate = a.telegram_after if a.telegram_after is not None else int(os.environ.get("SLACK_ASK_TELEGRAM_AFTER", "60"))
     try:
-        channels = channel_settings(a.channels, escalate)
+        channels = channel_settings(a.channels,
+            a.telegram_after if a.telegram_after is not None else int(os.environ.get("SLACK_ASK_TELEGRAM_AFTER", "60")))
     except ValueError as err:
         ap.error(str(err))
-    args = argparse.Namespace(owner=a.owner, origin=a.origin, slack_text=a.slack_text, channels=a.channels)
-    try:
-        ctx = make_ctx(args, telegram=channels["mode"] != "slack-only")
-    except BotAuthFailure as err:
-        warn(str(err))
-        return 5
-    if ctx.bot is None:  # no Slack on this host: telegram-only by default, a Slack mode is refused (nothing sent)
-        try:
-            channels = channel_settings(a.channels, escalate, no_slack=True)
-        except ValueError as err:
-            print(f"slack-ask: {err}", file=sys.stderr)
-            return 1
     qid = question_id(a.question, a.qid)
     name = f"ask-{int(time.time())}-{random.randrange(1_000_000):06d}"
     item_id = qid or f"ASK-{int(time.time())}"
@@ -327,6 +308,12 @@ def main(argv: list[str] | None = None) -> int:
     spec = {"title": first_line[:100], "channels": channels, "timeout": card_timeout,
             "slack_text": a.slack_text, "slack_text_reason": "standalone compatibility mode" if a.slack_text != "copy" else None,
             "approve_only": True, "items": [item]}
+    args = argparse.Namespace(owner=a.owner, origin=a.origin, slack_text=a.slack_text)
+    try:
+        ctx = make_ctx(args, telegram=channels["mode"] != "slack-only")
+    except BotAuthFailure as err:
+        warn(str(err))
+        return 5
     try:
         state = batch_send(ctx, spec, name)
     except CopyUnavailable as err:
@@ -340,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     if a.notify:
         sent_item["status"] = "done"
         save_batch(state)
-        result = {"answer": "sent", "via": "slack" if ctx.bot is not None else "telegram", "permalink": permalink_out, "waited_s": 0}
+        result = {"answer": "sent", "via": "slack", "permalink": permalink_out, "waited_s": 0}
         print(json.dumps(result, ensure_ascii=False) if a.json else "\n".join(f"{k}={v}" for k, v in result.items() if v is not None))
         return 0
 
@@ -596,15 +583,8 @@ SECTION_LIMIT = 3000
 
 
 def channel_settings(mode: str | None = None, escalate_after: int | None = None, *, default="slack-first",
-                     default_escalate=60, no_slack: bool = False) -> dict:
-    """Resolve explicit settings over the shared owner-channels.json preference. no_slack (no Slack bot token on this
-    host): the mode is telegram-only — by default, whatever the preference says — and an explicit mode that needs Slack
-    is a ValueError."""
-    if no_slack:
-        if mode not in (None, "telegram-only"):
-            raise ValueError(f"channels {mode} needs Slack, but there is no SLACK_BOT_TOKEN on this host — "
-                             "only telegram-only works here; nothing sent")
-        return channel_settings("telegram-only", escalate_after, default=default, default_escalate=default_escalate)
+                     default_escalate=60) -> dict:
+    """Resolve explicit settings over the shared owner-channels.json preference."""
     path = Path(os.environ.get("OWNER_CHANNELS_CONFIG", Path.home() / ".config/lp-agent/owner-channels.json"))
     configured = {}
     try:
@@ -907,16 +887,13 @@ class Ctx:
 
     def __init__(self, bot, usr=None, tg=None, chat_id=None, owner: str = "U034A9RE6RF", origin: str = "",
                  runner=None, clock=time.time, sleep=time.sleep, pace: float = 0.0):
-        self.bot = OwnerDMClient(bot, owner) if bot is not None else None  # None: no Slack on this host
-        self.usr = OwnerDMClient(usr, owner) if usr is not None and bot is not None else None
+        self.bot, self.usr = OwnerDMClient(bot, owner), OwnerDMClient(usr, owner) if usr else None
         self.tg, self.chat_id = tg, chat_id
         self.owner, self.origin = owner, origin or socket.gethostname()
         self.runner = runner or Runner()
         self.clock, self.sleep, self.pace = clock, sleep, pace
-        self.bot_user = None
-        if self.bot is not None:
-            self.bot_user = str(self.bot.auth_test()["user_id"])
-            self.bot.conversations_open(users=owner)
+        self.bot_user = str(self.bot.auth_test()["user_id"])
+        self.bot.conversations_open(users=owner)
         if self.usr:
             self.usr.conversations_open(users=owner)
         self.tg_failures = 0
@@ -1215,7 +1192,7 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
     s["diff_head"] = diff_head
     blocks = slack_root_blocks(ctx, state, item, chunks, s, diff_head)
     options = item.get("options") or []
-    if "slack" in state.get("initial_channels", ["slack", "telegram"]) and is_new_root and ctx.bot is not None:
+    if "slack" in state.get("initial_channels", ["slack", "telegram"]) and is_new_root:
         first = ctx.bot.chat_postMessage(channel=state["slack_channel"], text=line, blocks=blocks,
                                          unfurl_links=False, unfurl_media=False)
         s["ts"] = str(first["ts"])
@@ -1235,7 +1212,7 @@ def send_round(ctx: Ctx, state: dict, item: dict, text: str, diff: str = "", str
     body_chunks = chunks if not is_new_root else chunks[1:]
     for i, block in enumerate(body_chunks, 1 if not is_new_root else 2):
         thread.append((f"{line} · продолжение {i}/{len(chunks)}", [section(f"*{line}* · продолжение {i}/{len(chunks)}"), block]))
-    if s.get("ts") and ctx.bot is not None:
+    if s.get("ts"):
         if not is_new_root:
             ctx.bot.chat_update(channel=state["slack_channel"], ts=s["ts"], text=line, blocks=blocks,
                                 unfurl_links=False, unfurl_media=False)
@@ -1331,7 +1308,7 @@ def notify(ctx: Ctx, state: dict, item: dict, text: str, telegram: bool = True) 
     the item id."""
     msg = f"{item['id']} · {text}"
     cur = item["rounds"][-1] if item["rounds"] else {"slack": {}, "telegram": {}}
-    if cur["slack"].get("ts") and ctx.bot is not None:
+    if cur["slack"].get("ts"):
         try:
             ctx.bot.chat_postMessage(channel=state["slack_channel"], thread_ts=cur["slack"]["ts"], text=msg, unfurl_links=False)
         except Exception as err:
@@ -2198,7 +2175,7 @@ def expire_items(ctx: Ctx, state: dict) -> None:
 def send_escalations(ctx: Ctx, state: dict) -> None:
     cfg = state.get("channels", {})
     mode, delay = cfg.get("mode", "slack-first"), cfg.get("escalate_after", 0)
-    if ctx.bot is None or mode.endswith("-only") or (delay == 0 and len(state.get("initial_channels", [])) == 2):
+    if mode.endswith("-only") or (delay == 0 and len(state.get("initial_channels", [])) == 2):
         return
     primary = "slack" if mode == "slack-first" else "telegram"
     for item in state["items"]:
@@ -2389,7 +2366,7 @@ def poll_slack(ctx: Ctx, state: dict, cache: dict | None = None) -> None:
     live = [i for i in state["items"] if i["rounds"] and i["status"] in OPEN + ("correcting",)]
     opened = [i for i in live if i["status"] in OPEN]
     live += [i for i in state["items"] if in_after_window(ctx, i)]  # their threads only: no reactions, no decisions
-    if opened and state.get("slack_channel") and ctx.bot is not None:
+    if opened and state.get("slack_channel"):
         msgs = (cache or {}).get((id(ctx.bot), state["slack_channel"])) or _history(
             ctx.bot, state["slack_channel"], min(i["rounds"][-1]["slack"]["ts"] for i in opened))
         for item in opened:
@@ -2460,8 +2437,6 @@ def slack_groups(ctx: Ctx, states: dict[str, dict]) -> dict:
     """{(id(client), channel): (client, [timestamps], [batch names])} — one history call per channel for every batch."""
     ensure_owner_client(ctx, states)
     groups: dict[tuple[int, str], tuple[object, list[str], list[str]]] = {}
-    if ctx.bot is None:  # no Slack on this host: nothing to poll
-        return groups
     for name, state in states.items():
         opened = [i for i in state["items"] if i["status"] in OPEN and i["rounds"]]
         if state.get("slack_channel") and opened:
@@ -3295,7 +3270,7 @@ def batch_watch(ctx: Ctx, names: list[str] | None = None, timeout: int = 0, slac
             loaded = {n: load_batch(n) for n in (names or list_batches())}
             refresh_status(ctx, gstate, loaded)
             ensure_owner_client(ctx, loaded)
-            if ctx.usr is None and ctx.bot is not None:
+            if ctx.usr is None:
                 for state in loaded.values():
                     if state.get("slack_text") == "copy" and any(i["status"] in OPEN for i in state["items"]):
                         state["owner_auth_failed"] = True
@@ -3915,7 +3890,7 @@ def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
         ch_delay = raw_channels.get("escalate_after")
     else:
         ch_mode, ch_delay = raw_channels, None
-    channels = channel_settings(ch_mode, ch_delay, default="slack-first", default_escalate=0, no_slack=ctx.bot is None)
+    channels = channel_settings(ch_mode, ch_delay, default="slack-first", default_escalate=0)
     slack_text = spec.get("slack_text", "copy")
     if slack_text not in SLACK_TEXT_MODES:
         raise ValueError("slack_text must be copy, bot-thread, or off")
@@ -4014,8 +3989,6 @@ def batch_send(ctx: Ctx, spec: dict, name: str) -> dict:
     state.setdefault("judge", os.environ.get("SLACK_ASK_JUDGE", spec.get("judge", "model")))
     state.setdefault("slack_text", slack_text)
     state.setdefault("initial_channels", initial)
-    if ctx.bot is None and "slack" in state["initial_channels"]:
-        raise ValueError(f"batch {name} is a Slack batch, but there is no SLACK_BOT_TOKEN on this host — nothing sent")
     if "slack" in state["initial_channels"] and state["slack_text"] == "copy" and ctx.usr is None \
             and any(not i["rounds"] for i in state["items"]):
         raise CopyUnavailable("the owner's Slack token is missing or rejected — corrections cannot go to a copy. "
@@ -4286,7 +4259,7 @@ def batch_edit(ctx: Ctx, state: dict, item_id: str, changes: dict, note: str | N
     s, previous_last = rnd["slack"], item.get("last")
     old_options, new_options = item.get("options") or [], fields.get("options", item.get("options")) or []
     stale = []
-    if plan["options_changed"] and s.get("ts") and state.get("slack_channel") and ctx.bot is not None:
+    if plan["options_changed"] and s.get("ts") and state.get("slack_channel"):
         stale = stale_number_reactions(ctx, state, s, old_options, new_options)
         s["used"] = list(dict.fromkeys(s.get("used", []) + [NUM[n - 1] for n in stale]))
     for key, value in fields.items():
@@ -4315,7 +4288,7 @@ def batch_edit(ctx: Ctx, state: dict, item_id: str, changes: dict, note: str | N
     if stale:
         line += f"; реакции {', '.join(str(n) for n in stale)} поставлены до правки и не засчитаны — поставь заново"
     failed: list[str] = []
-    if s.get("ts") and state.get("slack_channel") and ctx.bot is not None:
+    if s.get("ts") and state.get("slack_channel"):
         try:
             if plan["options_changed"]:
                 prev, want = _preset_reactions(old_options), _preset_reactions(new_options)
@@ -4540,17 +4513,9 @@ def batch_wait(name: str, ids: list[str] | None, timeout: int, poll: float, cloc
 def make_ctx(a, telegram: bool = True) -> Ctx:
     bot_env = read_env(Path(os.environ.get("SLACK_BOT_ENV", Path.home() / ".config/lp-agent/slack-bot.env")))
     token = os.environ.get("SLACK_BOT_TOKEN") or bot_env.get("SLACK_BOT_TOKEN")
-    ao = _ask_owner()
     if not token:
-        # No Slack on this host (the freelance channel): Telegram alone is enough — a Ctx without Slack clients
-        if not (telegram and ao.CONFIG.exists()):
-            raise SystemExit("slack-ask batch: нет SLACK_BOT_TOKEN (~/.config/lp-agent/slack-bot.env)")
-        explicit = getattr(a, "channels", None)
-        if explicit not in (None, "telegram-only"):
-            raise SystemExit(f"slack-ask batch: --channels {explicit} требует Slack, а SLACK_BOT_TOKEN нет "
-                             "(~/.config/lp-agent/slack-bot.env) — ничего не отправлено; здесь работает только telegram-only")
-        cfg = json.loads(ao.CONFIG.read_text(encoding="utf-8"))
-        return Ctx(None, None, ao.http_call(cfg["token"]), cfg["owner_chat_id"], owner=a.owner, origin=a.origin, pace=0.4)
+        raise SystemExit("slack-ask batch: нет SLACK_BOT_TOKEN (~/.config/lp-agent/slack-bot.env)")
+    ao = _ask_owner()
     tg = chat_id = None
     if telegram and ao.CONFIG.exists():
         cfg = json.loads(ao.CONFIG.read_text(encoding="utf-8"))
@@ -4811,7 +4776,7 @@ def batch_cli(argv: list[str]) -> int:
             print(f"slack-ask batch: NOT SENT further — {err}", file=sys.stderr)
             return 7
         print(batch_show(state))
-        print(f"state: {batch_dir(a.batch) / 'state.json'}\nnext: nothing — systemd slack-ask-watch.timer on this host "
+        print(f"state: {batch_dir(a.batch) / 'state.json'}\nnext: nothing — on rdsh2 systemd slack-ask-watch.timer "
               "picks the batch up within a minute")
         if any(i.get("approve_only") for i in state["items"]):
             print(f"⚠ approve_only: ✅ ничего не запустит — агент действует сам. Узнать о решении: в фоне "
