@@ -2349,6 +2349,17 @@ def in_after_window(ctx: Ctx, item: dict) -> bool:
     return ctx.clock() - last <= AFTER_DECISION_WINDOW_S
 
 
+def is_question_to_agent(item: dict, text: str) -> bool:
+    """An open item's owner text that asks the agent something: «?» anywhere in it and it is not an option pick.
+    Items with options: the text is not «<number>, …»; yes/no approve_only items without a corrector (they have no
+    options, their text would be recorded as `commented`): any text with «?»."""
+    if item["status"] not in OPEN or item.get("options_text") == "corrections" or "?" not in text:
+        return False
+    if item.get("options"):
+        return not text_choice(text, len(item["options"]))
+    return bool(item.get("yesno") and item.get("approve_only") and not (item.get("hooks") or {}).get("on_corrections"))
+
+
 def poll_slack(ctx: Ctx, state: dict, cache: dict | None = None) -> None:
     """One history call per channel for all waiting items: reactions on the bot messages, replies in copies."""
     check_deliveries(ctx, state)
@@ -2409,10 +2420,10 @@ def poll_slack(ctx: Ctx, state: dict, cache: dict | None = None) -> None:
                 to_agent(ctx, state, item, f"после решения: {text}", "slack:after_decision", chat=ctx.chat_id,
                          after_decision=True)
                 continue
-            if item["status"] in OPEN and item.get("options") and item.get("options_text") != "corrections" \
-                    and "?" in text and not text_choice(text, len(item["options"])):
+            if is_question_to_agent(item, text):
                 # a question to the agent, not an own option (2026-11-19 rtr-b1g1: choice=0, label = the question;
-                # 2026-11-20 plat4640-boot686: the «?» was in the middle of the text)
+                # 2026-11-20 plat4640-boot686: the «?» was in the middle of the text); a yes/no approve_only item
+                # without a corrector has no options at all — its text is a comment unless it asks something
                 to_agent(ctx, state, item, text, "slack:thread-question", chat=ctx.chat_id,
                          response="Передал агенту как вопрос")
                 continue
@@ -3576,35 +3587,67 @@ def to_agent(ctx: "Ctx", state: dict, item: dict, text: str, via: str, chat=None
     return reply
 
 
-def batch_reply(state: dict, item_id: str, text: str, tg=None, chat_id=None) -> list[int]:
-    """Send an agent clarification as a reply to each recipient's current-round card."""
+def batch_reply(state: dict, item_id: str, text: str, tg=None, chat_id=None, ctx: "Ctx | None" = None) -> list[int]:
+    """Send an agent clarification where the owner waits for it: the thread of the Slack copy of the card (no copy —
+    the thread of the bot's card) and, as a reply to each recipient's current-round card, Telegram. Either channel
+    alone is enough: no Telegram — Slack still goes. The Slack ts is kept in `agent_reply_ids` and in `seen` of the
+    round, so the watch never reads the agent's own line (it stands in the owner's DM under the owner's user)."""
     item = next((it for it in state["items"] if it["id"] == item_id), None)
     if item is None or not item.get("rounds"):
         raise ValueError(f"{item_id}: no current round")
     if not str(text).strip():
         raise ValueError("reply text is empty")
-    if tg is None:
-        raise ValueError("Telegram is not configured")
-    ctx = tg_only_ctx(tg, chat_id)
+    slack_ok = ctx is not None and getattr(ctx, "bot", None) is not None
+    if tg is None and ctx is not None:
+        tg, chat_id = getattr(ctx, "tg", None), getattr(ctx, "chat_id", None)
+    if tg is None and not slack_ok:
+        raise ValueError("neither Telegram nor Slack is configured")
     round_ = item["rounds"][-1]
-    sent = []
-    for person in recipients_of(ctx, state):
-        chat = person["chat_id"]
-        telegram = round_["telegram"]
-        cards = tg_cards(ctx, telegram).get(int(chat)) or {}
-        card = cards.get("card_id")
-        reply_to = {"reply_to_message_id": card, "allow_sending_without_reply": True} if card else {}
-        mid = tg_send(ctx, chat_id=chat, text=f"{item_id} · {text.strip()}", **reply_to)
-        if telegram.get("chats"):
-            telegram["chats"].setdefault(str(chat), cards).setdefault("extra_ids", []).append(mid)
-        else:
-            telegram.setdefault("extra_ids", []).append(mid)
-        round_.setdefault("agent_reply_ids", []).append({"chat_id": int(chat), "message_id": mid,
-                                                           "sent_at": now_iso()})
-        sent.append(mid)
-    journal(state, item, "agent_reply", via="cli", text=text.strip(), message_ids=sent)
+    sent, slack_ts = [], None
+    if slack_ok:
+        slack_ts = post_agent_reply_to_slack(ctx, state, item, round_, f"{item_id} · {text.strip()}")
+    if tg is not None:
+        tctx = tg_only_ctx(tg, chat_id)
+        for person in recipients_of(tctx, state):
+            chat = person["chat_id"]
+            telegram = round_["telegram"]
+            cards = tg_cards(tctx, telegram).get(int(chat)) or {}
+            card = cards.get("card_id")
+            reply_to = {"reply_to_message_id": card, "allow_sending_without_reply": True} if card else {}
+            mid = tg_send(tctx, chat_id=chat, text=f"{item_id} · {text.strip()}", **reply_to)
+            if telegram.get("chats"):
+                telegram["chats"].setdefault(str(chat), cards).setdefault("extra_ids", []).append(mid)
+            else:
+                telegram.setdefault("extra_ids", []).append(mid)
+            round_.setdefault("agent_reply_ids", []).append({"chat_id": int(chat), "message_id": mid,
+                                                               "sent_at": now_iso()})
+            sent.append(mid)
+    journal(state, item, "agent_reply", via="cli", text=text.strip(), message_ids=sent,
+            **({"slack_ts": slack_ts} if slack_ts else {}))
     save_batch(state)
     return sent
+
+
+def post_agent_reply_to_slack(ctx: "Ctx", state: dict, item: dict, round_: dict, text: str) -> str | None:
+    """The agent's line into the Slack thread of the round: the owner's copy (posted under the owner's token — the
+    channel is the owner's DM), without a copy the bot's card thread. A Slack failure is a warning: Telegram still goes."""
+    s = round_["slack"]
+    if s.get("copy_ts") and getattr(ctx, "usr", None) is not None and state.get("copy_channel"):
+        client, channel, thread_ts = ctx.usr, state["copy_channel"], s["copy_ts"]
+    elif s.get("ts") and state.get("slack_channel"):
+        client, channel, thread_ts = ctx.bot, state["slack_channel"], s["ts"]
+    else:
+        return None
+    try:
+        ts = str(client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text,
+                                         unfurl_links=False, unfurl_media=False)["ts"])
+    except Exception as err:
+        warn(f"agent reply to Slack failed: {err}")
+        return None
+    s.setdefault("seen", []).append(ts)  # the agent's own ts: never an owner text
+    round_.setdefault("agent_reply_ids", []).append({"slack_ts": ts, "channel": channel, "thread_ts": thread_ts,
+                                                       "sent_at": now_iso()})
+    return ts
 
 
 def item_spec_problems(it: dict) -> list[str]:
@@ -4487,7 +4530,7 @@ def batch_cli(argv: list[str]) -> int:
             state = load_batch(a.batch)
             message = a.text if a.text is not None else a.file.read_text(encoding="utf-8")
             tg, chat_id = (None, None) if a.no_telegram else cancel_telegram()
-            batch_reply(state, a.item, message, tg=tg, chat_id=chat_id)
+            batch_reply(state, a.item, message, tg=tg, chat_id=chat_id, ctx=closing_ctx(a))
         except (OSError, ValueError) as err:
             print(f"slack-ask batch reply: {err}", file=sys.stderr)
             return 2

@@ -1156,3 +1156,114 @@ def test_after_decision_flag_is_saved_and_duplicate_does_not_mark_foreign_note(e
     sa.to_agent(c, st, item, "ответ", "telegram:to_agent")
     sa.to_agent(c, st, item, "после решения: да", "slack:after_decision", after_decision=True)  # duplicate
     assert "after_decision" not in st["to_agent"][1] and len(st["to_agent"]) == 2
+
+
+# --- ответ агента в треде копии и вопросы владельца (slack-ask-thread-reply) ---------------------------------
+
+def _yesno_spec(extra=None):
+    item = {"id": "PLAT-3198", "title": "Публикуем?", "payload": "Текст", "yesno": True, "approve_only": True}
+    item.update(extra or {})
+    return {"title": "T", "channels": {"mode": "slack-first", "escalate_after": 0}, "approve_only": True, "items": [item]}
+
+
+def _agent_posts(env, channel, thread_ts):
+    return [m for m in env.ws.thread(channel, thread_ts) if m["ts"] != thread_ts and "ответ агента" in m["text"]]
+
+
+def test_batch_reply_goes_to_the_copy_thread_and_to_telegram_and_is_remembered(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _yesno_spec(), "r-copy")
+    rnd = st["items"][0]["rounds"][0]
+    sa.batch_reply(st, "PLAT-3198", "ответ агента: проверяю", tg=env.tg, chat_id=TG_OWNER, ctx=c)
+    posts = _agent_posts(env, "DSELF", rnd["slack"]["copy_ts"])
+    assert len(posts) == 1, "agent reply did not reach the Slack copy thread"
+    assert any(m == "sendMessage" and "ответ агента" in p.get("text", "") for m, p in env.tg.calls)
+    entry = next(e for e in rnd["agent_reply_ids"] if e.get("slack_ts"))
+    assert entry["slack_ts"] == posts[0]["ts"] and posts[0]["ts"] in rnd["slack"]["seen"]
+    journaled = [json.loads(l) for l in sa.batch_dir("r-copy").joinpath("journal.jsonl").read_text().splitlines()]
+    assert posts[0]["ts"] in json.dumps(journaled[-1])
+
+
+def test_batch_reply_without_copy_goes_to_the_bot_card_thread(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _yesno_spec(), "r-bot")
+    rnd = st["items"][0]["rounds"][0]
+    rnd["slack"]["copy_ts"] = None  # no copy: the card thread of the bot
+    sa.batch_reply(st, "PLAT-3198", "ответ агента: без копии", tg=env.tg, chat_id=TG_OWNER, ctx=c)
+    assert len(_agent_posts(env, "DBOT", rnd["slack"]["ts"])) == 1
+
+
+def test_batch_reply_without_telegram_still_reaches_slack(env):
+    c = env.ctx(tg_on=False)
+    st = sa.batch_send(c, _yesno_spec(), "r-notg")
+    rnd = st["items"][0]["rounds"][0]
+    sa.batch_reply(st, "PLAT-3198", "ответ агента: без телеграма", ctx=c)
+    assert len(_agent_posts(env, "DSELF", rnd["slack"]["copy_ts"])) == 1
+
+
+def test_batch_reply_without_any_channel_is_refused(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _yesno_spec(), "r-none")
+    with pytest.raises(ValueError):
+        sa.batch_reply(st, "PLAT-3198", "x")
+
+
+def test_agent_reply_in_copy_thread_is_not_read_as_owner_text(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _yesno_spec(), "r-own")
+    item = st["items"][0]
+    sa.batch_reply(st, "PLAT-3198", "ответ агента: это не владелец", tg=env.tg, chat_id=TG_OWNER, ctx=c)
+    sa.poll_slack_batches(c, {"r-own": st})
+    assert item["status"] in sa.OPEN and not st.get("to_agent")
+
+
+def test_owner_reply_after_agent_reply_on_commented_item_goes_to_agent(env):
+    """Бой 24.11: corrections/commented → ответ агента → «жду ответы на вопросы в этом треде» потерялось."""
+    c = env.ctx()
+    st = sa.batch_send(c, _yesno_spec(), "r-after")
+    item = st["items"][0]
+    copy_ts = item["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "правка без вопроса", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"r-after": st})
+    assert item["status"] == "commented"
+    sa.batch_reply(st, "PLAT-3198", "ответ агента: понял", tg=env.tg, chat_id=TG_OWNER, ctx=c)
+    env.ws.post(OWNER, "DSELF", "жду ответы на вопросы в этом треде", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"r-after": st})
+    assert [n["text"] for n in st["to_agent"]] == ["после решения: жду ответы на вопросы в этом треде"]
+    assert st["to_agent"][0]["via"] == "slack:after_decision"
+
+
+def test_terminal_item_thread_is_read_when_another_open_item_makes_history_newer(env):
+    """Общая история копии: окно oldest берётся по открытым карточкам — тред закрытого item, старее их, пропадал."""
+    c = env.ctx()
+    spec = _yesno_spec()
+    st = sa.batch_send(c, spec, "r-old")
+    item = st["items"][0]
+    copy_ts = item["rounds"][0]["slack"]["copy_ts"]
+    item["status"] = "commented"
+    sa.journal(st, item, "commented", via="test")
+    other = sa.batch_send(c, {**_yesno_spec(), "items": [{**_yesno_spec()["items"][0], "id": "PLAT-1"}]}, "r-new")
+    env.ws.post(OWNER, "DSELF", "жду ответы", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"r-old": st, "r-new": other})
+    assert [n["via"] for n in st.get("to_agent", [])] == ["slack:after_decision"]
+
+
+def test_yesno_approve_only_multiline_text_with_questions_goes_to_agent_and_item_stays_open(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _yesno_spec(), "r-q")
+    item = st["items"][0]
+    copy_ts = item["rounds"][0]["slack"]["copy_ts"]
+    text = "тут проверены\nCRM:\n• пуш с подарком?\n• приватные подарки выдача?\nDO:\n• xamarin api?\n\nkmm выше"
+    env.ws.post(OWNER, "DSELF", text, thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"r-q": st})
+    assert item["status"] in sa.OPEN
+    assert [n["via"] for n in st["to_agent"]] == ["slack:thread-question"] and st["to_agent"][0]["text"] == text
+
+
+def test_yesno_approve_only_text_without_question_is_still_a_comment(env):
+    c = env.ctx()
+    st = sa.batch_send(c, _yesno_spec(), "r-nq")
+    copy_ts = st["items"][0]["rounds"][0]["slack"]["copy_ts"]
+    env.ws.post(OWNER, "DSELF", "поправь формулировку", thread_ts=copy_ts)
+    sa.poll_slack_batches(c, {"r-nq": st})
+    assert st["items"][0]["status"] == "commented" and not st.get("to_agent")
